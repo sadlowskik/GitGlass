@@ -1,0 +1,165 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Theme tokens. Colors are stored as raw "R G B" triplets so Tailwind's
+ * <alpha-value> mechanism works. Dark is the default (see index.html .dark);
+ * the .light class is toggled on <html> by the theme store.
+ */
+:root,
+.dark {
+  --surface-0: 13 15 20; /* app chrome / deepest */
+  --surface-1: 20 23 30;
+  --surface-2: 27 31 40;
+  --surface-3: 36 41 52;
+
+  --content-strong: 244 246 250;
+  --content: 209 214 224;
+  --content-muted: 148 155 170;
+  --content-faint: 99 106 122;
+
+  --git-staged: 63 185 108; /* green */
+  --git-modified: 219 178 62; /* yellow */
+  --git-untracked: 88 166 255; /* blue */
+  --git-ignored: 110 118 134; /* gray */
+  --git-conflict: 232 90 90; /* red */
+
+  --accent: 139 122 255; /* violet */
+  --accent-soft: 62 55 120;
+  --github: 63 185 108; /* connected-state accent */
+
+  color-scheme: dark;
+}
+
+.light {
+  --surface-0: 246 247 250;
+  --surface-1: 255 255 255;
+  --surface-2: 240 242 247;
+  --surface-3: 228 231 238;
+
+  --content-strong: 20 24 33;
+  --content: 45 51 64;
+  --content-muted: 96 104 120;
+  --content-faint: 148 155 170;
+
+  --git-staged: 40 160 90;
+  --git-modified: 176 132 20;
+  --git-untracked: 40 120 220;
+  --git-ignored: 150 156 168;
+  --git-conflict: 210 60 60;
+
+  --accent: 108 92 231;
+  --accent-soft: 224 220 255;
+  --github: 40 160 90;
+
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-surface-0 text-content antialiased;
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* Prevent the OS from selecting UI chrome text; opt back in per-element. */
+  user-select: none;
+  overflow: hidden;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+
+/* Thin, unobtrusive scrollbars that respect the theme. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-surface-3;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-content-faint;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+/*
+ * Syntax highlighting tokens for the diff viewer. Rather than ship a full
+ * highlight.js theme, we map the handful of token classes we care about to
+ * theme-aware colors so diffs match light and dark automatically.
+ */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-section,
+.hljs-doctag {
+  color: rgb(197 165 255);
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-addition {
+  color: rgb(126 209 138);
+}
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet {
+  color: rgb(240 180 120);
+}
+.hljs-comment,
+.hljs-quote {
+  color: rgb(var(--content-faint));
+  font-style: italic;
+}
+.hljs-title,
+.hljs-name,
+.hljs-attr,
+.hljs-function .hljs-title {
+  color: rgb(120 190 255);
+}
+.hljs-type,
+.hljs-built_in,
+.hljs-class .hljs-title {
+  color: rgb(120 220 220);
+}
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable {
+  color: rgb(240 160 180);
+}
+.light .hljs-keyword,
+.light .hljs-selector-tag,
+.light .hljs-literal {
+  color: rgb(124 58 237);
+}
+.light .hljs-string,
+.light .hljs-addition {
+  color: rgb(22 128 61);
+}
+.light .hljs-number {
+  color: rgb(180 83 9);
+}
+.light .hljs-title,
+.light .hljs-name,
+.light .hljs-attr {
+  color: rgb(29 78 216);
+}
+.light .hljs-type,
+.light .hljs-built_in {
+  color: rgb(13 148 136);
+}
+
+/* The frosted-glass panel treatment. */
+.glass {
+  @apply bg-surface-1/70 shadow-glass backdrop-blur-xl;
+  border: 1px solid rgb(255 255 255 / 0.06);
+}
+.light .glass {
+  border: 1px solid rgb(0 0 0 / 0.06);
+}

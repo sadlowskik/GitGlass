@@ -1,0 +1,58 @@
+[package]
+name = "gitglass"
+version = "0.1.0"
+description = "A visual file explorer with Git and GitHub built in."
+authors = ["The GitGlass authors"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+# Tauri v2 uses a lib + thin main binary so mobile targets can reuse the lib.
+name = "gitglass_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# libgit2 bindings — all git operations go through this, never the git CLI.
+# vendored-libgit2 statically links libgit2 so end users need no system git.
+# "https" enables the TLS transport (WinHTTP/SChannel on Windows — no OpenSSL)
+# so clone/push to GitHub over https works.
+git2 = { version = "0.19", default-features = false, features = [
+    "vendored-libgit2",
+    "https",
+] }
+notify = "6"
+notify-debouncer-full = "0.3"
+dirs = "5"
+# M3 secret scanner.
+regex = "1"
+# M4 GitHub: REST client (native-tls = SChannel on Windows) + OS keychain.
+reqwest = { version = "0.13", features = ["json"] }
+# Per-OS keychain backends: Windows Credential Manager + macOS Keychain. Each
+# feature only compiles on its own target, so listing both is cross-platform-safe.
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# By default Tauri ships a custom protocol; keep it explicit for clarity.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
