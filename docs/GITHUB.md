@@ -29,17 +29,38 @@ the code GitGlass shows you on the page it opens, and you're connected.
 
 ## What GitGlass asks for
 
-Scope requested: `repo read:user`.
+Scope requested: `repo read:user workflow`.
 - `read:user` — to show who you're signed in as.
 - `repo` — to create repositories, push, open pull requests, and read PR/issue
   status. (GitHub's device flow doesn't offer a narrower scope that still allows
   creating private repos.)
+- `workflow` — to push files under `.github/workflows`. GitHub rejects *the
+  whole push* without it, and GitGlass writes workflows (Automations).
+
+If you signed in before `workflow` was requested, your stored token predates the
+scope: **sign out and sign in again** to grant it. A push that trips this reports
+exactly that.
 
 ## Where the token lives
 
 Only in the **Windows Credential Manager** (macOS Keychain later), under service
 `GitGlass`, account `github-token`. Never in `.env`, never in app config, never
 logged. Sign out removes it. See [SECURITY.md](SECURITY.md).
+
+## Who the token is sent to
+
+Only `github.com`, and only over HTTPS. The check parses the URL and compares
+the **host** — a substring test would hand the token to `github.com.evil.tld`
+or `https://github.com@evil.tld/…`. Cloning a non-GitHub URL still works; it
+just proceeds unauthenticated instead. See [SECURITY.md](SECURITY.md).
+
+## Signing your commits (Git identity)
+
+Separate from GitHub sign-in: Git stamps each commit with a name and email, and
+a fresh machine has neither. GitGlass asks for them the first time you save and
+stores them in your **global** Git config, so it's once per machine, not per
+repo. It offers your GitHub login and `<login>@users.noreply.github.com`, which
+keeps your real address off public commits. No terminal needed.
 
 ## Troubleshooting
 

@@ -26,8 +26,12 @@ fn list_dir(
     let path = PathBuf::from(path);
     let listing = fs::list_dir(&path)?;
 
-    if let Some(repo) = &listing.repo {
-        watch.watch(&app, PathBuf::from(&repo.root));
+    match &listing.repo {
+        Some(repo) => watch.watch(&app, PathBuf::from(&repo.root)),
+        // Navigating out of a repo must release the watch. Without this the
+        // previous repo stayed watched — OS handle, debouncer thread and its
+        // path cache — with no subscriber on the other end.
+        None => watch.clear(),
     }
     Ok(listing)
 }
@@ -37,11 +41,9 @@ fn home_dir() -> AppResult<String> {
     Ok(fs::home_dir()?.to_string_lossy().to_string())
 }
 
-/// Reveal a path in the OS file manager. Best-effort; failure is non-fatal.
+/// Reveal a path in the OS file manager (Explorer/Finder), selecting the item.
 #[tauri::command]
 fn reveal_in_os(path: String) -> AppResult<()> {
-    // Uses the OS "opener" conventions; wired to a plugin in a later milestone.
-    // For M1 we simply validate the path exists so the UI can trust the result.
     let p = PathBuf::from(&path);
     if !p.exists() {
         return Err(error::AppError::new(
@@ -49,7 +51,16 @@ fn reveal_in_os(path: String) -> AppResult<()> {
             "That item no longer exists.",
         ));
     }
-    Ok(())
+    // This used to stop at the existence check and return Ok(()) — the menu
+    // item did nothing, and because the UI only surfaces the error case, a
+    // silent no-op was indistinguishable from success.
+    tauri_plugin_opener::reveal_item_in_dir(&p).map_err(|e| {
+        error::AppError::new(
+            error::ErrorKind::Io,
+            "Couldn’t open your file manager for that item.",
+        )
+        .with_detail(e.to_string())
+    })
 }
 
 // --- M2: Git actions --------------------------------------------------------
@@ -90,16 +101,7 @@ fn scan_folder(path: String) -> AppResult<Vec<secret_scan::Finding>> {
 #[tauri::command]
 fn commit(repo: String, message: String, allow_secrets: bool) -> AppResult<String> {
     let repo_path = PathBuf::from(repo);
-    if !allow_secrets {
-        let findings = secret_scan::scan_staged(&repo_path)?;
-        if !findings.is_empty() {
-            return Err(error::AppError::new(
-                error::ErrorKind::SecretsFound,
-                "Blocked: these changes look like they contain secrets.",
-            )
-            .with_detail(format!("{} suspected secret(s) found.", findings.len())));
-        }
-    }
+    secret_scan::gate(&repo_path, allow_secrets)?;
     git::ops::commit(&repo_path, &message)
 }
 
@@ -114,6 +116,12 @@ fn ignore_paths(repo: String, paths: Vec<String>) -> AppResult<()> {
 #[tauri::command]
 fn git_identity() -> AppResult<git::ops::Identity> {
     Ok(git::ops::git_identity())
+}
+
+/// Save the name/email Git stamps on commits, to the user's global Git config.
+#[tauri::command]
+fn set_git_identity(name: String, email: String) -> AppResult<()> {
+    git::ops::set_git_identity(&name, &email)
 }
 
 /// Turn a plain folder into a local Git repository with a first commit.
@@ -145,6 +153,33 @@ fn push(repo: String) -> AppResult<String> {
     git::sync::push(&PathBuf::from(repo))
 }
 
+/// Fetch from the remote without merging — refreshes ahead/behind and tags.
+#[tauri::command]
+fn fetch(repo: String) -> AppResult<String> {
+    git::sync::fetch(&PathBuf::from(repo))
+}
+
+/// Discard uncommitted changes to the given paths, restoring them to HEAD.
+/// Destructive by design — the UI confirms before calling this.
+#[tauri::command]
+fn discard_paths(repo: String, paths: Vec<String>) -> AppResult<()> {
+    git::ops::discard_paths(&PathBuf::from(repo), &paths)
+}
+
+/// Amend the most recent commit with the staged tree and (optionally) a new
+/// message. Refuses if the commit is already on the remote.
+///
+/// Carries the same secret gate as `commit`, and for the same reason: amend
+/// writes the staged tree into a commit. It previously had no gate at all, so
+/// staging a key and clicking "Amend last commit" — the button next to Save in
+/// the same panel — committed it with no scan and no dialog.
+#[tauri::command]
+fn amend_commit(repo: String, message: String, allow_secrets: bool) -> AppResult<String> {
+    let repo_path = PathBuf::from(repo);
+    secret_scan::gate(&repo_path, allow_secrets)?;
+    git::ops::amend_commit(&repo_path, &message)
+}
+
 // --- M5: Diff viewer & branches ---------------------------------------------
 
 /// Structured diff of a single file (staged + unstaged combined vs HEAD).
@@ -169,8 +204,8 @@ fn switch_branch(repo: String, name: String) -> AppResult<()> {
 }
 
 #[tauri::command]
-fn delete_branch(repo: String, name: String) -> AppResult<()> {
-    git::branch::delete_branch(&PathBuf::from(repo), &name)
+fn delete_branch(repo: String, name: String, force: bool) -> AppResult<()> {
+    git::branch::delete_branch(&PathBuf::from(repo), &name, force)
 }
 
 // --- Automations: scheduled Python GitHub Actions ---------------------------
@@ -259,6 +294,13 @@ async fn github_clone(url: String, dest: String) -> AppResult<String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Connect a local repo to an EXISTING GitHub repo by setting its origin URL.
+/// Creates nothing on GitHub (that's `github_publish`).
+#[tauri::command]
+async fn github_set_origin(repo: String, url: String) -> AppResult<()> {
+    github::remote::set_origin(&PathBuf::from(repo), &url).await
+}
+
 #[tauri::command]
 async fn github_open_pr(repo: String, title: String, body: String) -> AppResult<github::PrResult> {
     github::remote::open_pr(&PathBuf::from(repo), &title, &body).await
@@ -334,9 +376,13 @@ pub fn run() {
             scan_folder,
             ignore_paths,
             git_identity,
+            set_git_identity,
             init_repo,
             pull,
             push,
+            fetch,
+            discard_paths,
+            amend_commit,
             file_diff,
             list_branches,
             create_branch,
@@ -352,6 +398,7 @@ pub fn run() {
             github_sign_out,
             github_publish,
             github_clone,
+            github_set_origin,
             github_open_pr,
             github_list_prs,
             github_list_issues,

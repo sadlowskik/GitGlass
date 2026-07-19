@@ -17,6 +17,7 @@ export function CommitPanel() {
   const stage = useAppStore((s) => s.stage);
   const unstage = useAppStore((s) => s.unstage);
   const requestCommit = useAppStore((s) => s.requestCommit);
+  const amend = useAppStore((s) => s.amend);
   const message = useAppStore((s) => s.commitMessage);
   const setMessage = useAppStore((s) => s.setCommitMessage);
   const busy = useAppStore((s) => s.busy);
@@ -94,7 +95,14 @@ export function CommitPanel() {
               className="mono w-full resize-none select-text rounded-lg border border-white/10 bg-surface-0 p-2.5 text-sm text-content outline-none placeholder:text-content-faint focus:border-accent"
             />
             <div className="mt-2 flex items-center justify-between">
-              <span className="text-xs text-content-faint">Tip: ⌘/Ctrl + Enter to save</span>
+              <button
+                onClick={() => void amend()}
+                disabled={busy}
+                title="Fold these staged changes into your last commit. Leave the message blank to keep the original wording. Not allowed once the commit is on GitHub."
+                className="rounded-lg px-2 py-1 text-xs text-content-muted transition-colors hover:bg-surface-2 hover:text-content disabled:opacity-40"
+              >
+                Amend last commit
+              </button>
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => setCommitOpen(false)}

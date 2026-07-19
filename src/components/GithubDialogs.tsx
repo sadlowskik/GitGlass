@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import clsx from "clsx";
-import { useGithubStore } from "@/store/useGithubStore";
+import { useGithubStore, isGithub } from "@/store/useGithubStore";
 import { useAppStore } from "@/store/useAppStore";
 import { api } from "@/lib/tauri";
 import type { AppError, Finding } from "@/lib/types";
@@ -17,6 +17,7 @@ export function GithubDialogs() {
       {dialog === "signin" && <SignInDialog />}
       {dialog === "publish" && <PublishDialog />}
       {dialog === "clone" && <CloneDialog />}
+      {dialog === "connect" && <ConnectDialog />}
       {dialog === "pr" && <OpenPrDialog />}
       {dialog === "release" && <ReleaseDialog />}
     </div>
@@ -34,10 +35,16 @@ function ReleaseDialog() {
     <Shell title="Create a release">
       <div className="space-y-3">
         <p className="text-xs text-content-muted">
-          This tags your latest code and starts a build on GitHub. In a few minutes, installers for
-          <span className="font-medium text-content"> Windows (.exe/.msi)</span> and
-          <span className="font-medium text-content"> macOS (.dmg)</span> appear on your repo’s
-          Releases page — that’s the link you share.
+          This puts a version tag on the latest commit of your repository’s{" "}
+          <span className="font-medium text-content">default branch on GitHub</span> (push your
+          work first if you want it included).
+        </p>
+        <p className="text-xs text-content-muted">
+          If your repo has a release workflow, the tag triggers it and installers for{" "}
+          <span className="font-medium text-content">Windows (.exe/.msi)</span> and{" "}
+          <span className="font-medium text-content">macOS (.dmg)</span> appear on the Releases
+          page. We’ll open the Actions tab so you can watch it — if nothing runs, your repo
+          doesn’t have that workflow yet.
         </p>
         <div>
           <label className={label}>Version</label>
@@ -57,7 +64,7 @@ function ReleaseDialog() {
             disabled={busy || !valid}
             onClick={() => void createRelease(tag.trim())}
           >
-            {busy ? "Starting…" : "Create release & build"}
+            {busy ? "Tagging…" : "Create release"}
           </button>
         </div>
       </div>
@@ -141,6 +148,7 @@ function SignInDialog() {
 function PublishDialog() {
   const folder = useAppStore((s) => s.listing?.repo?.root ?? s.listing?.path);
   const isRepo = useAppStore((s) => !!s.listing?.repo);
+  const remoteUrl = useAppStore((s) => s.listing?.repo?.remoteUrl ?? null);
   const publish = useGithubStore((s) => s.publish);
   const busy = useGithubStore((s) => s.busy);
   const notify = useAppStore((s) => s.notify);
@@ -152,22 +160,41 @@ function PublishDialog() {
   // Pre-publish secret preview + typed override.
   const [scan, setScan] = useState<Finding[] | null>(null);
   const [scanning, setScanning] = useState(false);
+  const [scanFailed, setScanFailed] = useState(false);
   const [overridePhrase, setOverridePhrase] = useState("");
 
-  const runScan = async () => {
+  const runScan = useCallback(async () => {
     if (!folder) return;
     setScanning(true);
     setScan(null);
+    setScanFailed(false);
     try {
       setScan(await api.scanFolder(folder));
     } catch (e) {
+      setScanFailed(true);
       notify({ kind: "error", title: (e as AppError)?.message ?? "Scan failed" });
     } finally {
       setScanning(false);
     }
-  };
+  }, [folder, notify]);
+
+  // Scan as soon as the dialog opens. This used to be opt-in behind a button,
+  // which meant `hasSecrets` stayed false until the user chose to look — so the
+  // Publish button's "disabled when hasSecrets" check was satisfied by simply
+  // never scanning, while the dialog claimed publishing was blocked.
+  useEffect(() => {
+    void runScan();
+  }, [runScan]);
 
   const hasSecrets = !!scan && scan.length > 0;
+  // Don't offer Publish until we know what's in the folder. A failed scan is
+  // not a clean scan: fall back to letting the user retry rather than treating
+  // "we couldn't look" as "nothing there".
+  const scanPending = scanning || (!scan && !scanFailed);
+  // Publishing creates a NEW repo and repoints `origin` at it. If this repo is
+  // already wired to a non-GitHub remote, that link would be silently replaced —
+  // warn, and point them at "Connect" if they meant to link the existing repo.
+  const willReplaceRemote = !!remoteUrl && !isGithub(remoteUrl);
 
   return (
     <Shell title="Publish to GitHub">
@@ -176,6 +203,15 @@ function PublishDialog() {
           <p className="rounded-lg bg-surface-0/60 p-2.5 text-xs text-content-muted">
             This folder isn’t tracked by Git yet. GitGlass will set it up and make the first commit
             for you, then push it to a new GitHub repository.
+          </p>
+        )}
+        {willReplaceRemote && (
+          <p className="rounded-lg border border-git-conflict/30 bg-git-conflict/10 p-2.5 text-xs text-content-muted">
+            This folder is already connected to a remote:{" "}
+            <span className="mono break-all text-content">{remoteUrl}</span>. Publishing creates a
+            new GitHub repo and <span className="text-content">replaces</span> that connection. If
+            you meant to link this folder to a repo that already exists, close this and use{" "}
+            <span className="font-medium text-content">Connect</span> instead.
           </p>
         )}
         <div>
@@ -201,7 +237,7 @@ function PublishDialog() {
           Keep this repository private
         </label>
 
-        {/* Pre-publish secret check */}
+        {/* Pre-publish secret check — runs automatically on open. */}
         <div className="rounded-lg border border-white/10 p-2.5">
           <div className="flex items-center gap-2">
             <button
@@ -209,17 +245,36 @@ function PublishDialog() {
               disabled={scanning || !folder}
               className="rounded-lg bg-surface-2 px-2.5 py-1.5 text-xs font-medium text-content transition-colors hover:bg-surface-3 disabled:opacity-50"
             >
-              {scanning ? "Scanning…" : "Check for secrets"}
+              {scanning ? "Scanning…" : "Re-check for secrets"}
             </button>
             <span className="text-xs text-content-faint">
-              Scan every file before it leaves your computer.
+              Every file is scanned before it leaves your computer.
             </span>
           </div>
 
-          {scan && !hasSecrets && (
-            <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-git-staged">
-              <CheckIcon className="h-3.5 w-3.5" /> No secrets found — safe to publish.
+          {scanFailed && (
+            <p className="mt-2 text-xs font-medium text-git-conflict">
+              The scan didn’t finish, so we can’t tell you whether this folder is clean. Try again
+              before publishing.
             </p>
+          )}
+
+          {scan && !hasSecrets && (
+            <>
+              <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-git-staged">
+                <CheckIcon className="h-3.5 w-3.5" /> No secrets found in your files.
+              </p>
+              {isRepo && (
+                // Publishing an existing repo uploads its whole history. The
+                // scan reads the files as they are now, so a secret that was
+                // committed and later deleted still goes up. Say so rather than
+                // implying a clean bill of health.
+                <p className="mt-1 text-xs text-content-faint">
+                  This checks your files as they are now. Anything you committed and later removed
+                  is still in this project’s history and will be uploaded too.
+                </p>
+              )}
+            </>
           )}
 
           {hasSecrets && (
@@ -295,10 +350,10 @@ function PublishDialog() {
         <div className="flex justify-end pt-1">
           <button
             className={primaryBtn}
-            disabled={busy || name.trim().length === 0 || hasSecrets}
+            disabled={busy || scanPending || name.trim().length === 0 || hasSecrets}
             onClick={() => void publish(name.trim(), isPrivate, description, false)}
           >
-            {busy ? "Publishing…" : "Publish"}
+            {busy ? "Publishing…" : scanPending ? "Checking…" : "Publish"}
           </button>
         </div>
       </div>
@@ -353,6 +408,48 @@ function CloneDialog() {
             onClick={() => dest && void clone(url.trim(), dest)}
           >
             {busy ? "Cloning…" : "Clone"}
+          </button>
+        </div>
+      </div>
+    </Shell>
+  );
+}
+
+/**
+ * Link the current local repo to an EXISTING GitHub repo (sets origin). Distinct
+ * from Publish, which creates a brand-new repo. Used when the repo already lives
+ * on GitHub but this local folder isn't wired to it yet.
+ */
+function ConnectDialog() {
+  const connectOrigin = useGithubStore((s) => s.connectOrigin);
+  const busy = useGithubStore((s) => s.busy);
+  const [url, setUrl] = useState("");
+
+  const valid = !!deriveName(url);
+
+  return (
+    <Shell title="Connect to a GitHub repository">
+      <div className="space-y-3">
+        <p className="text-xs text-content-muted">
+          Links this folder to a repository that already exists on GitHub. Nothing
+          new is created. After connecting, Pull and Push work as usual.
+        </p>
+        <div>
+          <label className={label}>Repository URL</label>
+          <input
+            className={input}
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://github.com/owner/repo"
+          />
+        </div>
+        <div className="flex justify-end pt-1">
+          <button
+            className={primaryBtn}
+            disabled={busy || !valid}
+            onClick={() => void connectOrigin(url.trim())}
+          >
+            {busy ? "Connecting…" : "Connect"}
           </button>
         </div>
       </div>

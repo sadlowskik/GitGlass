@@ -80,6 +80,10 @@ export const api = {
   /** The user's configured Git identity (may be unset). */
   gitIdentity: () => call<Identity>("git_identity"),
 
+  /** Save the name/email Git stamps on commits (global Git config). */
+  setGitIdentity: (name: string, email: string) =>
+    call<void>("set_git_identity", { name, email }),
+
   /** Turn a plain folder into a local Git repo + first commit. No GitHub. */
   initRepo: (
     path: string,
@@ -94,13 +98,29 @@ export const api = {
   /** Push the current branch to upstream; resolves to a friendly summary. */
   push: (repo: string) => call<string>("push", { repo }),
 
+  /** Fetch from the remote without merging; refreshes ahead/behind + tags. */
+  fetch: (repo: string) => call<string>("fetch", { repo }),
+
+  /** Discard uncommitted changes to paths, restoring them to HEAD. Destructive. */
+  discardPaths: (repo: string, paths: string[]) =>
+    call<void>("discard_paths", { repo, paths }),
+
+  /**
+   * Amend the last commit with the staged tree and (optionally) a new message.
+   * Carries the same `allowSecrets` gate as `commit` — amend writes the staged
+   * tree into a commit, so it needs the same scan.
+   */
+  amendCommit: (repo: string, message: string, allowSecrets: boolean) =>
+    call<string>("amend_commit", { repo, message, allowSecrets }),
+
   // --- M5: Diffs & branches ---
   fileDiff: (repo: string, path: string) => call<FileDiff>("file_diff", { repo, path }),
   listBranches: (repo: string) => call<BranchInfo[]>("list_branches", { repo }),
   createBranch: (repo: string, name: string, checkout: boolean) =>
     call<void>("create_branch", { repo, name, checkout }),
   switchBranch: (repo: string, name: string) => call<void>("switch_branch", { repo, name }),
-  deleteBranch: (repo: string, name: string) => call<void>("delete_branch", { repo, name }),
+  deleteBranch: (repo: string, name: string, force = false) =>
+    call<void>("delete_branch", { repo, name, force }),
 
   // --- Automations: scheduled Python workflows ---
   listPythonFiles: (repo: string) => call<string[]>("list_python_files", { repo }),
@@ -137,6 +157,9 @@ export const api = {
       allowSecrets,
     }),
   githubClone: (url: string, dest: string) => call<string>("github_clone", { url, dest }),
+  /** Connect a local repo to an EXISTING GitHub repo (sets origin; creates nothing). */
+  githubSetOrigin: (repo: string, url: string) =>
+    call<void>("github_set_origin", { repo, url }),
   githubOpenPr: (repo: string, title: string, body: string) =>
     call<PrResult>("github_open_pr", { repo, title, body }),
   githubListPrs: (repo: string) => call<GhItem[]>("github_list_prs", { repo }),

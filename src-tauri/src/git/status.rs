@@ -33,6 +33,30 @@ pub struct RepoContext {
     pub origin_url: Option<String>,
     /// Absolute path -> status, for every non-clean/ignored entry git reports.
     statuses: HashMap<PathBuf, GitStatus>,
+    /// Directory roll-ups, precomputed once from `statuses`. Without this,
+    /// `dir_status` scanned the whole status map per subdirectory, making a
+    /// single listing O(directories x entries) — ~240ms for a 50k-entry repo
+    /// with 20 subfolders, on a path the file watcher can fire every 300ms.
+    dir_rollup: HashMap<PathBuf, DirRollup>,
+}
+
+/// What a directory's descendants add up to. `only_ignored` starts true and is
+/// cleared by the first actionable child, so it must not derive Default.
+#[derive(Debug, Clone, Copy)]
+struct DirRollup {
+    any_child: bool,
+    has_changes: bool,
+    only_ignored: bool,
+}
+
+impl Default for DirRollup {
+    fn default() -> Self {
+        DirRollup {
+            any_child: false,
+            has_changes: false,
+            only_ignored: true,
+        }
+    }
 }
 
 impl RepoContext {
@@ -59,6 +83,7 @@ impl RepoContext {
             .ok()
             .and_then(|r| r.url().map(|s| s.to_string()));
         let statuses = collect_statuses(&repo, &root)?;
+        let dir_rollup = roll_up_dirs(&statuses, &root);
 
         Ok(Some(RepoContext {
             root,
@@ -68,6 +93,7 @@ impl RepoContext {
             behind,
             origin_url,
             statuses,
+            dir_rollup,
         }))
     }
 
@@ -96,36 +122,54 @@ impl RepoContext {
     }
 
     /// Roll-up for a directory: does any descendant have an actionable change?
-    /// Ignored and clean descendants do not count as "changes".
+    /// Ignored and clean descendants do not count as "changes". O(1) — the work
+    /// happens once in `roll_up_dirs`.
     pub fn dir_status(&self, abs_dir: &Path) -> (GitStatus, bool) {
-        let dir = normalize(abs_dir);
-        let mut has_changes = false;
-        let mut only_ignored = true;
-        let mut any_child = false;
-
-        for (path, status) in &self.statuses {
-            if !path.starts_with(&dir) {
-                continue;
-            }
-            any_child = true;
-            match status {
-                GitStatus::Ignored => {}
-                GitStatus::Clean => {}
-                _ => {
-                    has_changes = true;
-                    only_ignored = false;
-                }
-            }
-        }
-
+        let Some(r) = self.dir_rollup.get(&normalize(abs_dir)) else {
+            return (GitStatus::Clean, false);
+        };
         // A folder that contains only ignored entries reads as ignored (gray).
-        let status = if any_child && only_ignored && !has_changes {
+        let status = if r.any_child && r.only_ignored && !r.has_changes {
             GitStatus::Ignored
         } else {
             GitStatus::Clean
         };
-        (status, has_changes)
+        (status, r.has_changes)
     }
+}
+
+/// Fold every status entry into its ancestor directories, once. Each entry
+/// contributes to itself and to every ancestor up to (and including) `root` —
+/// matching the `path.starts_with(dir)` test this replaces, which was also true
+/// for `path == dir`. That self-match is what makes an ignored directory git
+/// reports as a single entry (`node_modules/`) render gray.
+fn roll_up_dirs(
+    statuses: &HashMap<PathBuf, GitStatus>,
+    root: &Path,
+) -> HashMap<PathBuf, DirRollup> {
+    let root = normalize(root);
+    let mut rollup: HashMap<PathBuf, DirRollup> = HashMap::new();
+
+    for (path, status) in statuses {
+        for anc in path.ancestors() {
+            if !anc.starts_with(&root) {
+                break;
+            }
+            let e = rollup.entry(anc.to_path_buf()).or_default();
+            e.any_child = true;
+            match status {
+                GitStatus::Ignored | GitStatus::Clean => {}
+                _ => {
+                    e.has_changes = true;
+                    e.only_ignored = false;
+                }
+            }
+            if anc == root {
+                break;
+            }
+        }
+    }
+    rollup
 }
 
 /// Compute how far the current branch is ahead/behind its upstream, using only
@@ -274,5 +318,98 @@ mod tests {
     #[test]
     fn classify_clean_when_empty() {
         assert_eq!(classify(Status::CURRENT), GitStatus::Clean);
+    }
+
+    // --- Directory roll-up -------------------------------------------------
+    // These pin the behaviour `dir_status` had when it scanned the whole status
+    // map per directory, so the O(1) precomputed version can't silently drift.
+
+    fn ctx(root: &str, entries: &[(&str, GitStatus)]) -> RepoContext {
+        let root = PathBuf::from(root);
+        let statuses: HashMap<PathBuf, GitStatus> = entries
+            .iter()
+            .map(|(p, s)| (normalize(&root.join(p)), *s))
+            .collect();
+        let dir_rollup = roll_up_dirs(&statuses, &root);
+        RepoContext {
+            root,
+            branch: None,
+            is_detached: false,
+            ahead: None,
+            behind: None,
+            origin_url: None,
+            statuses,
+            dir_rollup,
+        }
+    }
+
+    #[test]
+    fn dir_with_a_modified_descendant_has_changes() {
+        let c = ctx("/repo", &[("src/deep/a.rs", GitStatus::Modified)]);
+        assert_eq!(
+            c.dir_status(Path::new("/repo/src")),
+            (GitStatus::Clean, true)
+        );
+        // The roll-up must reach every level, not just the immediate parent.
+        assert_eq!(
+            c.dir_status(Path::new("/repo/src/deep")),
+            (GitStatus::Clean, true)
+        );
+        assert_eq!(c.dir_status(Path::new("/repo")), (GitStatus::Clean, true));
+    }
+
+    #[test]
+    fn dir_containing_only_ignored_entries_reads_as_ignored() {
+        let c = ctx("/repo", &[("build/out.js", GitStatus::Ignored)]);
+        assert_eq!(
+            c.dir_status(Path::new("/repo/build")),
+            (GitStatus::Ignored, false)
+        );
+    }
+
+    /// git reports an ignored directory as one entry (`node_modules/`) rather
+    /// than walking it. That entry must colour the directory itself — the old
+    /// `starts_with` test matched `path == dir`, and the roll-up has to too.
+    #[test]
+    fn ignored_directory_entry_colours_itself() {
+        let c = ctx("/repo", &[("node_modules", GitStatus::Ignored)]);
+        assert_eq!(
+            c.dir_status(Path::new("/repo/node_modules")),
+            (GitStatus::Ignored, false)
+        );
+    }
+
+    #[test]
+    fn dir_with_no_entries_is_clean() {
+        let c = ctx("/repo", &[("src/a.rs", GitStatus::Modified)]);
+        assert_eq!(
+            c.dir_status(Path::new("/repo/untouched")),
+            (GitStatus::Clean, false)
+        );
+    }
+
+    /// A mix of ignored and actionable children is "has changes", not "ignored".
+    #[test]
+    fn changes_win_over_ignored_siblings() {
+        let c = ctx(
+            "/repo",
+            &[
+                ("src/gen.js", GitStatus::Ignored),
+                ("src/main.rs", GitStatus::Staged),
+            ],
+        );
+        assert_eq!(
+            c.dir_status(Path::new("/repo/src")),
+            (GitStatus::Clean, true)
+        );
+    }
+
+    /// The walk must stop at the repo root and never attribute changes to
+    /// directories above it.
+    #[test]
+    fn rollup_does_not_escape_the_repo_root() {
+        let c = ctx("/repo", &[("src/a.rs", GitStatus::Modified)]);
+        assert!(!c.dir_rollup.contains_key(Path::new("/")));
+        assert_eq!(c.dir_status(Path::new("/")), (GitStatus::Clean, false));
     }
 }

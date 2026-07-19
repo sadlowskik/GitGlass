@@ -5,6 +5,9 @@ import type { AppError, DirListing, Finding, PinnedRepo } from "@/lib/types";
 
 type Theme = "dark" | "light";
 
+/** A write that turns the staged tree into a commit. Both need the secret gate. */
+type WriteAction = "commit" | "amend";
+
 export interface Toast {
   id: number;
   kind: "success" | "error" | "info";
@@ -45,6 +48,14 @@ interface AppState {
   unstage: (paths: string[]) => Promise<void>;
   pull: () => Promise<void>;
   push: () => Promise<void>;
+  fetch: () => Promise<void>;
+  amend: () => Promise<void>;
+
+  // Discard uncommitted changes — routed through a confirm dialog (destructive).
+  discardTarget: string[] | null;
+  requestDiscard: (paths: string[]) => void;
+  cancelDiscard: () => void;
+  confirmDiscard: () => Promise<void>;
 
   // Diff viewer (M5)
   diffPath: string | null;
@@ -59,8 +70,19 @@ interface AppState {
   initRepoOpen: boolean;
   setInitRepoOpen: (open: boolean) => void;
 
+  // Identity prompt: shown when a commit fails because Git has no name/email.
+  // Holds the pending write's allowSecrets and which action to resume.
+  identityPrompt: { allowSecrets: boolean; action: WriteAction } | null;
+  cancelIdentityPrompt: () => void;
+  saveIdentityAndCommit: (name: string, email: string) => Promise<void>;
+
   // Secret guard (M3)
   secretFindings: Finding[] | null;
+  /**
+   * Which write the guard is currently gating. Amend goes through the same gate
+   * as commit — it writes the staged tree into a commit just as commit does.
+   */
+  secretGuardAction: WriteAction;
   requestCommit: () => Promise<void>;
   confirmOverrideCommit: () => Promise<void>;
   cancelSecretGuard: () => void;
@@ -167,36 +189,45 @@ export const useAppStore = create<AppState>()(
       initRepoOpen: false,
       setInitRepoOpen: (open) => set({ initRepoOpen: open }),
 
-      secretFindings: null,
+      identityPrompt: null,
+      cancelIdentityPrompt: () => set({ identityPrompt: null }),
 
-      // Scan first; if anything is found, open the guard instead of committing.
-      requestCommit: async () => {
-        const repo = get().listing?.repo?.root;
-        const message = get().commitMessage;
-        if (!repo || message.trim().length === 0) return;
+      // Save the identity, then finish the commit the user already asked for —
+      // they shouldn't have to retype the message and press save twice.
+      saveIdentityAndCommit: async (name, email) => {
+        const pending = get().identityPrompt;
+        if (!pending) return;
         set({ busy: true });
         try {
-          const findings = await api.scanStaged(repo);
-          if (findings.length > 0) {
-            set({ secretFindings: findings });
-            return;
-          }
-          await doCommit(set, get, message, false);
+          await api.setGitIdentity(name, email);
+          set({ identityPrompt: null });
+          await doWrite(set, get, pending.action, get().commitMessage, pending.allowSecrets);
         } catch (e) {
+          // A rejected name/email keeps the dialog open so it can be corrected.
           get().notify(errorToast(e));
         } finally {
           set({ busy: false });
         }
       },
 
+      secretFindings: null,
+      secretGuardAction: "commit",
+
+      // Scan first; if anything is found, open the guard instead of committing.
+      requestCommit: async () => {
+        const message = get().commitMessage;
+        if (message.trim().length === 0) return;
+        await guardThen(set, get, "commit", message);
+      },
+
       // Only reachable after the typed confirmation in SecretGuardDialog.
       confirmOverrideCommit: async () => {
-        const message = get().commitMessage;
+        const action = get().secretGuardAction;
         set({ busy: true });
         try {
-          await doCommit(set, get, message, true);
+          await doWrite(set, get, action, get().commitMessage, true);
         } catch (e) {
-          get().notify(errorToast(e));
+          if (!promptForIdentity(set, e, true, action)) get().notify(errorToast(e));
         } finally {
           set({ busy: false });
         }
@@ -247,6 +278,53 @@ export const useAppStore = create<AppState>()(
         }
       },
 
+      fetch: async () => {
+        const repo = get().listing?.repo?.root;
+        if (!repo) return;
+        set({ busy: true });
+        try {
+          const summary = await api.fetch(repo);
+          // Refresh so the newly-known "behind" count shows up in the toolbar.
+          await get().refresh();
+          get().notify({ kind: "success", title: summary });
+        } catch (e) {
+          get().notify(errorToast(e));
+        } finally {
+          set({ busy: false });
+        }
+      },
+
+      // Discard is destructive, so it flows through a confirmation dialog rather
+      // than firing on click. `discardTarget` holds the paths awaiting confirm.
+      discardTarget: null,
+      requestDiscard: (paths) => {
+        if (paths.length > 0) set({ discardTarget: paths });
+      },
+      cancelDiscard: () => set({ discardTarget: null }),
+      confirmDiscard: async () => {
+        const repo = get().listing?.repo?.root;
+        const paths = get().discardTarget;
+        if (!repo || !paths) return;
+        set({ busy: true });
+        try {
+          await api.discardPaths(repo, paths);
+          set({ discardTarget: null });
+          await get().refresh();
+          get().notify({ kind: "success", title: "Changes discarded" });
+        } catch (e) {
+          get().notify(errorToast(e));
+        } finally {
+          set({ busy: false });
+        }
+      },
+
+      // Amend goes through the same secret gate as commit. It sits next to Save
+      // in the commit panel and writes the same staged tree, so a bypass here
+      // would be a bypass of the whole gate.
+      amend: async () => {
+        await guardThen(set, get, "amend", get().commitMessage);
+      },
+
       bootstrap: async () => {
         applyTheme(get().theme);
         try {
@@ -272,20 +350,79 @@ function errorToast(e: unknown): Omit<Toast, "id"> {
   return { kind: "error", title: err?.message ?? "Something went wrong.", detail: err?.detail };
 }
 
-// Shared commit path for both the normal flow and the secret override. Throws on
-// failure so callers surface the error; only touches success state on success.
-async function doCommit(
+/**
+ * A commit that failed only because Git has no name/email is recoverable, so
+ * open the identity dialog instead of showing a toast the user can't act on.
+ * Returns whether the error was handled.
+ */
+function promptForIdentity(
+  set: (partial: Partial<AppState>) => void,
+  e: unknown,
+  allowSecrets: boolean,
+  action: WriteAction,
+): boolean {
+  if ((e as AppError)?.kind !== "no_identity") return false;
+  // Close the secret guard as we move on: reaching a commit means the secret
+  // gate is already passed (allowSecrets) or was clear. Leaving it open would
+  // stack it behind the identity dialog. `allowSecrets` and `action` are carried
+  // in identityPrompt so the resumed write still honours the override and still
+  // does what the user originally asked for.
+  set({ secretFindings: null, identityPrompt: { allowSecrets, action } });
+  return true;
+}
+
+/**
+ * The single entry point for anything that writes the staged tree: scan first,
+ * open the guard if anything turns up, otherwise go ahead. Both commit and
+ * amend route through here so neither can acquire an ungated path.
+ *
+ * The backend re-scans regardless — this is the good UX, not the enforcement.
+ */
+async function guardThen(
   set: (partial: Partial<AppState>) => void,
   get: () => AppState,
+  action: WriteAction,
+  message: string,
+) {
+  const repo = get().listing?.repo?.root;
+  if (!repo) return;
+  set({ busy: true });
+  try {
+    const findings = await api.scanStaged(repo);
+    if (findings.length > 0) {
+      set({ secretFindings: findings, secretGuardAction: action });
+      return;
+    }
+    await doWrite(set, get, action, message, false);
+  } catch (e) {
+    if (!promptForIdentity(set, e, false, action)) get().notify(errorToast(e));
+  } finally {
+    set({ busy: false });
+  }
+}
+
+// Shared write path for the normal flow and the secret override. Throws on
+// failure so callers surface the error; only touches success state on success.
+async function doWrite(
+  set: (partial: Partial<AppState>) => void,
+  get: () => AppState,
+  action: WriteAction,
   message: string,
   allowSecrets: boolean,
 ) {
   const repo = get().listing?.repo?.root;
   if (!repo) return;
-  await api.commit(repo, message, allowSecrets);
+  if (action === "amend") {
+    await api.amendCommit(repo, message, allowSecrets);
+  } else {
+    await api.commit(repo, message, allowSecrets);
+  }
   set({ commitMessage: "", commitOpen: false, secretFindings: null });
   await get().refresh();
-  get().notify({ kind: "success", title: "Changes saved" });
+  get().notify({
+    kind: "success",
+    title: action === "amend" ? "Commit amended" : "Changes saved",
+  });
 }
 
 function applyTheme(theme: Theme) {

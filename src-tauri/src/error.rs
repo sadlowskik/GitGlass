@@ -30,6 +30,9 @@ pub enum ErrorKind {
     Auth,
     /// The staged changes contain suspected secrets; commit was blocked.
     SecretsFound,
+    /// A branch delete was refused because it has unmerged/unpushed commits.
+    /// The UI can offer to force it after confirming.
+    UnmergedBranch,
     Git,
     Io,
     #[allow(dead_code)]

@@ -21,13 +21,26 @@ export function GithubActions() {
 
   if (!onGithub) {
     return (
-      <button
-        onClick={() => openDialog("publish")}
-        className="flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-github ring-1 ring-github/30 transition-colors hover:bg-github/10"
-      >
-        <GithubIcon className="h-3.5 w-3.5" />
-        Publish
-      </button>
+      <div className="flex shrink-0 items-center gap-1">
+        {/* Connect only makes sense for an existing repo (it sets origin); a
+            plain folder has nothing to connect, so Publish is the only path. */}
+        {listing.repo && (
+          <button
+            onClick={() => openDialog("connect")}
+            title="Link this folder to a repo that already exists on GitHub"
+            className="rounded-lg px-2.5 py-1 text-xs font-medium text-content-muted transition-colors hover:bg-surface-2 hover:text-content"
+          >
+            Connect
+          </button>
+        )}
+        <button
+          onClick={() => openDialog("publish")}
+          className="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-github ring-1 ring-github/30 transition-colors hover:bg-github/10"
+        >
+          <GithubIcon className="h-3.5 w-3.5" />
+          Publish
+        </button>
+      </div>
     );
   }
 
@@ -42,7 +55,7 @@ export function GithubActions() {
       </button>
       <button
         onClick={() => openDialog("release")}
-        title="Build installers for Windows & Mac"
+        title="Tag a version — builds installers if your repo has a release workflow"
         className="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-github ring-1 ring-github/30 transition-colors hover:bg-github/10"
       >
         <RocketIcon />

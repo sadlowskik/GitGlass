@@ -8,11 +8,19 @@ use crate::error::AppResult;
 
 use super::ops::open_repo;
 
+/// Upper bound on lines returned for one file. A generated file or a lockfile
+/// can diff to hundreds of thousands of lines; every one of them becomes a JSON
+/// object over IPC and a DOM node in the viewer. The viewer shows a notice when
+/// this trips rather than pretending it rendered the whole thing.
+const MAX_DIFF_LINES: usize = 20_000;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffLineDto {
     /// "context" | "add" | "delete"
-    pub origin: String,
+    // &'static str, not String: this is one of three fixed values, and it was
+    // allocating a fresh heap String per diff line.
+    pub origin: &'static str,
     pub old_lineno: Option<u32>,
     pub new_lineno: Option<u32>,
     pub content: String,
@@ -31,6 +39,8 @@ pub struct FileDiffDto {
     pub path: String,
     pub is_binary: bool,
     pub hunks: Vec<DiffHunkDto>,
+    /// True when the diff exceeded `MAX_DIFF_LINES` and was cut short.
+    pub truncated: bool,
 }
 
 /// Produce the diff for a single file: its full change relative to HEAD
@@ -57,7 +67,9 @@ pub fn file_diff(repo_path: &Path, file_path: &str) -> AppResult<FileDiffDto> {
         path: rel.clone().unwrap_or_else(|| file_path.to_string()),
         is_binary: false,
         hunks: Vec::new(),
+        truncated: false,
     });
+    let lines_emitted = RefCell::new(0usize);
 
     diff.foreach(
         &mut |delta, _| {
@@ -85,11 +97,20 @@ pub fn file_diff(repo_path: &Path, file_path: &str) -> AppResult<FileDiffDto> {
                 // 'H'/'F' headers and other markers are not content lines.
                 _ => return true,
             };
+            // Keep returning true so libgit2 finishes cleanly; we just stop
+            // accumulating once we've hit the cap.
+            let mut n = lines_emitted.borrow_mut();
+            if *n >= MAX_DIFF_LINES {
+                acc.borrow_mut().truncated = true;
+                return true;
+            }
+            *n += 1;
+
             let content = String::from_utf8_lossy(line.content())
                 .trim_end_matches(['\n', '\r'])
                 .to_string();
             let dto = DiffLineDto {
-                origin: origin.to_string(),
+                origin,
                 old_lineno: line.old_lineno(),
                 new_lineno: line.new_lineno(),
                 content,

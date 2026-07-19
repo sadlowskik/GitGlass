@@ -8,9 +8,14 @@ use super::api;
 const KEYRING_SERVICE: &str = "GitGlass";
 const KEYRING_ACCOUNT: &str = "github-token";
 
-// Device flow needs both an authorize scope for repos and read access to the
-// signed-in user's profile.
-const SCOPE: &str = "repo read:user";
+// Scopes we request in the device flow:
+//   repo      — create repos, push, open PRs, read PR/issue status
+//   read:user — show who's signed in
+//   workflow  — REQUIRED to push files under .github/workflows. Without it
+//               GitHub rejects the whole push ("refusing to allow an OAuth App
+//               to create or update workflow ... without `workflow` scope"),
+//               which matters because GitGlass *writes* workflows (Automations).
+const SCOPE: &str = "repo read:user workflow";
 
 /// Token lives ONLY in the OS keychain (Windows Credential Manager / macOS
 /// Keychain). Never written to config, never logged.
@@ -168,19 +173,47 @@ pub async fn poll_login(client_id: &str, device_code: &str) -> AppResult<LoginPo
     })
 }
 
-/// Resolve the current signed-in account from the stored token, if any. Falls
-/// back to disconnected on any failure so the UI degrades gracefully.
+/// Last successfully-resolved account. A transient network error must not flip
+/// the UI to "signed out" when we still hold a valid token — so we fall back to
+/// this instead of `disconnected()`.
+fn last_good() -> &'static std::sync::Mutex<Option<AuthStatus>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<AuthStatus>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Resolve the current signed-in account from the stored token, if any.
+///
+/// Distinguishes a *rejected* token (really signed out) from a *transient*
+/// failure (network down, GitHub 5xx): the latter keeps us signed in and shows
+/// the last-known identity, because the token is still valid.
 pub async fn current_status() -> AuthStatus {
     let Some(token) = read_token() else {
+        *last_good().lock().unwrap() = None;
         return AuthStatus::disconnected();
     };
     match api::get_user(&token).await {
-        Ok(user) => AuthStatus {
+        Ok(user) => {
+            let status = AuthStatus {
+                connected: true,
+                login: Some(user.login),
+                avatar_url: user.avatar_url,
+            };
+            *last_good().lock().unwrap() = Some(status.clone());
+            status
+        }
+        // A real 401/403 means the token was rejected — genuinely signed out.
+        Err(e) if matches!(e.kind, ErrorKind::Auth) => {
+            *last_good().lock().unwrap() = None;
+            AuthStatus::disconnected()
+        }
+        // Network/5xx: we still hold a token, so stay signed in. Show the
+        // last-known identity if we have one, otherwise connected-without-name.
+        Err(_) => last_good().lock().unwrap().clone().unwrap_or(AuthStatus {
             connected: true,
-            login: Some(user.login),
-            avatar_url: user.avatar_url,
-        },
-        Err(_) => AuthStatus::disconnected(),
+            login: None,
+            avatar_url: None,
+        }),
     }
 }
 

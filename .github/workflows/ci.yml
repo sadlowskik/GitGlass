@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run lint
@@ -26,16 +26,40 @@ jobs:
       - run: npm test
 
   rust:
-    name: Rust (fmt · clippy · test)
-    runs-on: windows-latest
+    # Runs on both OSes: Windows uses SChannel for git2's TLS, macOS uses
+    # (vendored) OpenSSL, and the keychain backend differs too — so the Rust
+    # logic genuinely needs exercising on each. Without the macOS lane, nothing
+    # tests it there until a release tag builds the app.
+    name: Rust (fmt · clippy · test) — ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The release job cross-compiles the Intel half of the universal binary
+      # on an Apple Silicon runner. See the cross-compile check at the end of
+      # this job for why that target needs exercising here.
+      - name: Add x86_64 target (macOS cross-compile check)
+        if: matrix.os == 'macos-latest'
+        run: rustup target add x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      # `tauri::generate_context!()` reads the built frontend at ../dist, so the
+      # Rust crate cannot compile until the frontend is built. Without this,
+      # clippy/test fail with "frontendDist ... doesn't exist".
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build frontend (required for tauri codegen)
+        run: npm run build
       - name: rustfmt
         working-directory: src-tauri
         run: cargo fmt --all --check
@@ -45,6 +69,24 @@ jobs:
       - name: test
         working-directory: src-tauri
         run: cargo test
+
+      # Guards the one failure that used to reach a release tag unseen.
+      #
+      # `release.yml` builds `--target universal-apple-darwin`, which compiles
+      # the x86_64 half on an arm64 runner. `git2`'s `https` feature pulls in
+      # `openssl-sys`; without `vendored-openssl` that build script looks for a
+      # system OpenSSL via pkg-config, which cannot cross-compile — and the
+      # whole release fails with "Could not find directory of OpenSSL
+      # installation". Nothing in CI noticed, because every other macOS step
+      # builds natively for arm64, where a system OpenSSL is findable.
+      #
+      # `cargo check` runs build scripts, so this reproduces that failure in
+      # seconds without building the app. Do not drop it to `cargo check`
+      # without `--target`: the native build passes either way.
+      - name: Cross-compile check (x86_64 half of the universal binary)
+        if: matrix.os == 'macos-latest'
+        working-directory: src-tauri
+        run: cargo check --target x86_64-apple-darwin
 
   build:
     name: Build app (${{ matrix.platform }})
@@ -58,7 +100,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

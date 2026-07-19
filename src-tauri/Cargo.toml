@@ -1,6 +1,6 @@
 [package]
 name = "gitglass"
-version = "0.1.0"
+version = "0.2.0"
 description = "A visual file explorer with Git and GitHub built in."
 authors = ["The GitGlass authors"]
 license = "Apache-2.0"
@@ -16,7 +16,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+# No "devtools" feature: Tauri already enables the web inspector in debug
+# builds, and the feature's only effect is to ship it in RELEASE builds too.
+# That put a full IPC explorer in front of every end user. Opt in explicitly
+# (`--features devtools`) if you need to debug a production build.
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-opener = "2"
@@ -24,12 +28,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 # libgit2 bindings — all git operations go through this, never the git CLI.
-# vendored-libgit2 statically links libgit2 so end users need no system git.
-# "https" enables the TLS transport (WinHTTP/SChannel on Windows — no OpenSSL)
-# so clone/push to GitHub over https works.
+#   vendored-libgit2  — statically link libgit2; end users need no system git.
+#   https             — TLS transport so clone/push over https works. Uses
+#                       WinHTTP/SChannel on Windows, but OpenSSL on Unix/macOS.
+#   vendored-openssl  — build OpenSSL from source instead of requiring a system
+#                       one. Required for the macOS universal build: the Apple
+#                       Silicon runner has no x86_64 OpenSSL, so cross-compiling
+#                       the Intel half fails without this. Inert on Windows,
+#                       where openssl-sys isn't in the dependency tree at all.
 git2 = { version = "0.19", default-features = false, features = [
     "vendored-libgit2",
     "https",
+    "vendored-openssl",
 ] }
 notify = "6"
 notify-debouncer-full = "0.3"
@@ -38,6 +48,10 @@ dirs = "5"
 regex = "1"
 # M4 GitHub: REST client (native-tls = SChannel on Windows) + OS keychain.
 reqwest = { version = "0.13", features = ["json"] }
+# Real URL parsing for remote URLs. Deciding whether a remote is GitHub by
+# substring match sends the token to look-alike hosts (`github.com@evil.tld`),
+# so host comparison goes through a parser. Already in the tree via reqwest.
+url = "2"
 # Per-OS keychain backends: Windows Credential Manager + macOS Keychain. Each
 # feature only compiles on its own target, so listing both is cross-platform-safe.
 keyring = { version = "3", features = ["windows-native", "apple-native"] }
@@ -49,6 +63,8 @@ tempfile = "3"
 # By default Tauri ships a custom protocol; keep it explicit for clarity.
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Opt-in web inspector in release builds. Never enable for a shipped artifact.
+devtools = ["tauri/devtools"]
 
 [profile.release]
 codegen-units = 1

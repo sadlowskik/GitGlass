@@ -29,6 +29,73 @@ pub fn git_identity() -> Identity {
     }
 }
 
+/// Save the committer identity to the user's **global** Git config, creating the
+/// config file if they've never had one.
+///
+/// Global, not per-repo: "who you are" isn't a property of one project, and a
+/// first-time user who fixed this in one repo would just hit it again in the
+/// next. Goes through git2 rather than `git config`, per the no-CLI rule — the
+/// whole point is that the user never opens a terminal.
+pub fn set_git_identity(name: &str, email: &str) -> AppResult<()> {
+    let (name, email) = validate_identity(name, email)?;
+    write_identity(&mut global_config()?, &name, &email)
+}
+
+/// Reject the input that would otherwise produce commits nobody can attribute.
+/// Kept separate from the write so it's testable without touching the real
+/// user's `~/.gitconfig`.
+fn validate_identity(name: &str, email: &str) -> AppResult<(String, String)> {
+    let name = name.trim();
+    let email = email.trim();
+    if name.is_empty() {
+        return Err(AppError::new(
+            ErrorKind::NoIdentity,
+            "Please enter a name to sign your work with.",
+        ));
+    }
+    // Deliberately loose: Git itself accepts almost anything here, so this only
+    // catches obvious typos rather than trying to be an RFC 5322 validator.
+    let plausible = match email.split_once('@') {
+        Some((local, domain)) => !local.is_empty() && !domain.is_empty(),
+        None => false,
+    };
+    if !plausible {
+        return Err(AppError::new(
+            ErrorKind::NoIdentity,
+            "Please enter an email address, like you@example.com.",
+        ));
+    }
+    Ok((name.to_string(), email.to_string()))
+}
+
+fn write_identity(cfg: &mut git2::Config, name: &str, email: &str) -> AppResult<()> {
+    cfg.set_str("user.name", name)?;
+    cfg.set_str("user.email", email)?;
+    Ok(())
+}
+
+/// The writable global (`~/.gitconfig`) config level.
+fn global_config() -> AppResult<git2::Config> {
+    // The normal path: libgit2 already knows the global level.
+    if let Ok(cfg) = git2::Config::open_default() {
+        if let Ok(global) = cfg.open_level(git2::ConfigLevel::Global) {
+            return Ok(global);
+        }
+    }
+    // A machine that has never run git has no ~/.gitconfig, and there is no
+    // global level to open — name the file ourselves so the first save creates it.
+    let path = git2::Config::find_global()
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".gitconfig")))
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorKind::Io,
+                "GitGlass couldn’t find your home folder to save your Git settings.",
+            )
+        })?;
+    git2::Config::open(&path).map_err(Into::into)
+}
+
 /// Find Git repositories nested *inside* `root` (excluding root's own `.git`).
 /// Git can't track a repo within a repo, so these must be surfaced clearly
 /// rather than failing with a cryptic libgit2 error.
@@ -151,6 +218,28 @@ pub fn open_repo(path: &Path) -> AppResult<Repository> {
         .map_err(|_| AppError::new(ErrorKind::NotARepo, "This folder isn’t a Git repository."))
 }
 
+/// Point `refs/remotes/<remote>/<branch>` at the branch's current commit and
+/// set the branch to track it, so "N ahead / M behind" works after a push.
+/// libgit2's push doesn't create the remote-tracking ref the way the git CLI
+/// does, so we do it ourselves.
+///
+/// Best-effort by design: the push has already succeeded by the time this runs,
+/// and failing bookkeeping must never turn a successful push into an error.
+pub(crate) fn set_tracking(repo: &Repository, remote: &str, branch: &str, reflog_msg: &str) {
+    let Ok(oid) = repo.refname_to_id(&format!("refs/heads/{branch}")) else {
+        return;
+    };
+    let _ = repo.reference(
+        &format!("refs/remotes/{remote}/{branch}"),
+        oid,
+        true,
+        reflog_msg,
+    );
+    if let Ok(mut local) = repo.find_branch(branch, git2::BranchType::Local) {
+        let _ = local.set_upstream(Some(&format!("{remote}/{branch}")));
+    }
+}
+
 /// Normalize a path for prefix comparison: unify separators and strip Windows
 /// verbatim (`\\?\`) prefixes and any trailing separator. We intentionally do
 /// NOT touch case — paths from the UI share the same navigation origin as the
@@ -249,6 +338,101 @@ pub fn unstage_paths(repo_path: &Path, paths: &[String]) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+/// Discard uncommitted changes to the given paths, restoring them to their HEAD
+/// state. This DELIBERATELY overwrites working-tree edits and restores deleted
+/// files — it's the "throw away my changes" action, so the UI must confirm first.
+///
+/// Reverts both staged and unstaged modifications. Untracked files are left
+/// alone (they have no HEAD version to restore to). On an unborn branch there's
+/// no HEAD, so there's nothing tracked to discard.
+pub fn discard_paths(repo_path: &Path, paths: &[String]) -> AppResult<()> {
+    let repo = open_repo(repo_path)?;
+    let rel = relativize(&repo, paths)?;
+    if rel.is_empty() {
+        return Ok(());
+    }
+
+    let head = repo.head().map_err(|_| {
+        AppError::new(
+            ErrorKind::Git,
+            "There are no saved versions to restore to yet.",
+        )
+    })?;
+
+    // Unstage first (so a staged edit is undone too), then force the working
+    // tree back to HEAD for just these paths.
+    let obj = head.peel(git2::ObjectType::Commit)?;
+    let _ = repo.reset_default(Some(&obj), rel.iter());
+
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force();
+    for r in &rel {
+        checkout.path(r);
+    }
+    repo.checkout_head(Some(&mut checkout))?;
+    Ok(())
+}
+
+/// Amend the most recent commit with the currently staged tree and (if
+/// non-empty) a new message. Refuses when the commit is already on the remote,
+/// since amending rewrites history that others may have pulled.
+pub fn amend_commit(repo_path: &Path, message: &str) -> AppResult<String> {
+    let repo = open_repo(repo_path)?;
+    let head = repo
+        .head()
+        .map_err(|_| AppError::new(ErrorKind::Git, "There’s no commit to amend yet."))?;
+    let commit = head.peel_to_commit()?;
+
+    if commit_is_pushed(&repo, commit.id()) {
+        return Err(AppError::new(
+            ErrorKind::Git,
+            "This commit is already on the remote. Amending would rewrite shared history — make a new commit instead.",
+        ));
+    }
+
+    let signature = author_signature(&repo)?;
+    let mut index = repo.index()?;
+    let tree = repo.find_tree(index.write_tree()?)?;
+
+    let trimmed = message.trim();
+    let new_message = if trimmed.is_empty() {
+        commit.message().unwrap_or("").to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    let oid = commit.amend(
+        Some("HEAD"),
+        Some(&signature),
+        Some(&signature),
+        None,
+        Some(&new_message),
+        Some(&tree),
+    )?;
+    Ok(oid.to_string())
+}
+
+/// Whether `commit` is already reachable from the current branch's upstream
+/// (i.e. has been pushed). Conservative: if there's no upstream we treat it as
+/// unpushed. Uses the last-fetched remote-tracking ref, so it can only ever be
+/// stale in the *safe* direction after a fetch.
+fn commit_is_pushed(repo: &Repository, commit: git2::Oid) -> bool {
+    let Ok(head) = repo.head() else {
+        return false;
+    };
+    if !head.is_branch() {
+        return false;
+    }
+    let branch = git2::Branch::wrap(head);
+    let Ok(upstream) = branch.upstream() else {
+        return false;
+    };
+    let Some(up_oid) = upstream.get().target() else {
+        return false;
+    };
+    up_oid == commit || repo.graph_descendant_of(up_oid, commit).unwrap_or(false)
 }
 
 /// Create a commit from the currently staged index. Validates that (a) an
@@ -366,6 +550,65 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Writes go to a throwaway config file — a test must never touch the real
+    /// `~/.gitconfig` of whoever is running it.
+    #[test]
+    fn identity_round_trips_through_a_config_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("gitconfig");
+        let mut cfg = git2::Config::open(&path).unwrap();
+
+        write_identity(&mut cfg, "Ada Lovelace", "ada@example.com").unwrap();
+
+        // Re-open from disk: proves it persisted rather than just cached.
+        let reread = git2::Config::open(&path).unwrap();
+        assert_eq!(reread.get_string("user.name").unwrap(), "Ada Lovelace");
+        assert_eq!(reread.get_string("user.email").unwrap(), "ada@example.com");
+    }
+
+    #[test]
+    fn saving_identity_creates_a_config_file_that_did_not_exist() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("brand-new-gitconfig");
+        assert!(!path.exists());
+
+        let mut cfg = git2::Config::open(&path).unwrap();
+        write_identity(&mut cfg, "Ada", "ada@example.com").unwrap();
+
+        assert!(path.exists(), "first save must create the config file");
+    }
+
+    #[test]
+    fn identity_is_trimmed_before_saving() {
+        let (n, e) = validate_identity("  Ada Lovelace  ", "  ada@example.com  ").unwrap();
+        assert_eq!(n, "Ada Lovelace");
+        assert_eq!(e, "ada@example.com");
+    }
+
+    #[test]
+    fn blank_name_is_rejected_with_a_specific_error() {
+        let err = validate_identity("   ", "ada@example.com").unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::NoIdentity));
+        assert!(err.message.contains("name"));
+    }
+
+    #[test]
+    fn email_without_a_usable_at_sign_is_rejected() {
+        for bad in ["", "ada", "ada@", "@example.com", "   "] {
+            let err = validate_identity("Ada", bad).unwrap_err();
+            assert!(
+                matches!(err.kind, ErrorKind::NoIdentity),
+                "accepted bad email: {bad:?}"
+            );
+        }
+    }
+
+    /// GitHub's noreply form is what the dialog prefills, so it must validate.
+    #[test]
+    fn github_noreply_address_is_accepted() {
+        assert!(validate_identity("sadlowskik", "sadlowskik@users.noreply.github.com").is_ok());
+    }
+
     /// Init a repo with a committer identity and return its dir. `TempDir` is
     /// returned too so it isn't dropped (which would delete the directory).
     fn repo_with_identity() -> (TempDir, PathBuf) {
@@ -405,6 +648,95 @@ mod tests {
 
         let err = commit(&root, "nope").unwrap_err();
         assert!(matches!(err.kind, ErrorKind::NothingToCommit));
+    }
+
+    #[test]
+    fn discard_restores_a_modified_file_to_head() {
+        let (_d, root) = repo_with_identity();
+        fs::write(root.join("f.txt"), "original\n").unwrap();
+        stage_paths(&root, &[abs(&root, "f.txt")]).unwrap();
+        commit(&root, "add f").unwrap();
+
+        // Edit and stage the edit, then discard.
+        fs::write(root.join("f.txt"), "ruined\n").unwrap();
+        stage_paths(&root, &[abs(&root, "f.txt")]).unwrap();
+        discard_paths(&root, &[abs(&root, "f.txt")]).unwrap();
+
+        // Normalize CRLF: git may re-materialize with the platform line ending.
+        let restored = fs::read_to_string(root.join("f.txt"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert_eq!(restored, "original\n");
+    }
+
+    #[test]
+    fn discard_restores_a_deleted_file() {
+        let (_d, root) = repo_with_identity();
+        fs::write(root.join("keep.txt"), "keep\n").unwrap();
+        stage_paths(&root, &[abs(&root, "keep.txt")]).unwrap();
+        commit(&root, "add").unwrap();
+
+        fs::remove_file(root.join("keep.txt")).unwrap();
+        discard_paths(&root, &[abs(&root, "keep.txt")]).unwrap();
+
+        assert!(
+            root.join("keep.txt").exists(),
+            "deleted file should be restored"
+        );
+    }
+
+    #[test]
+    fn discard_leaves_untracked_files_alone() {
+        let (_d, root) = repo_with_identity();
+        fs::write(root.join("committed.txt"), "x\n").unwrap();
+        stage_paths(&root, &[abs(&root, "committed.txt")]).unwrap();
+        commit(&root, "c").unwrap();
+
+        fs::write(root.join("scratch.txt"), "my notes\n").unwrap();
+        // Discarding the whole repo dir must not delete untracked scratch.txt.
+        discard_paths(&root, &[abs(&root, "scratch.txt")]).unwrap();
+
+        assert!(
+            root.join("scratch.txt").exists(),
+            "untracked file must survive"
+        );
+    }
+
+    #[test]
+    fn amend_replaces_message_without_new_commit_parent() {
+        let (_d, root) = repo_with_identity();
+        fs::write(root.join("f.txt"), "a\n").unwrap();
+        stage_paths(&root, &[abs(&root, "f.txt")]).unwrap();
+        commit(&root, "typo mesage").unwrap();
+
+        amend_commit(&root, "fixed message").unwrap();
+
+        let repo = Repository::open(&root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap(), "fixed message");
+        assert_eq!(head.parent_count(), 0, "amend must not add a parent");
+    }
+
+    #[test]
+    fn amend_with_blank_message_keeps_the_original() {
+        let (_d, root) = repo_with_identity();
+        fs::write(root.join("f.txt"), "a\n").unwrap();
+        stage_paths(&root, &[abs(&root, "f.txt")]).unwrap();
+        commit(&root, "keep me").unwrap();
+
+        // New staged content, empty message → message preserved, content updated.
+        fs::write(root.join("f.txt"), "b\n").unwrap();
+        stage_paths(&root, &[abs(&root, "f.txt")]).unwrap();
+        amend_commit(&root, "   ").unwrap();
+
+        let repo = Repository::open(&root).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap(), "keep me");
+        let blob = head.tree().unwrap().get_name("f.txt").unwrap().id();
+        assert_eq!(
+            std::str::from_utf8(repo.find_blob(blob).unwrap().content()).unwrap(),
+            "b\n"
+        );
     }
 
     #[test]
@@ -506,5 +838,49 @@ mod tests {
         let repo = Repository::open(&root).unwrap();
         let rels = relativize(&repo, &[root.to_string_lossy().to_string()]).unwrap();
         assert_eq!(rels, vec![PathBuf::from("*")]);
+    }
+}
+
+/// Exercises the real `set_git_identity` — including `global_config()`, which the
+/// other identity tests bypass — against a redirected global config location.
+///
+/// This is the case that actually breaks first-time users: a machine with no
+/// `~/.gitconfig` at all, where `Config::find_global()` fails outright. Writing
+/// has to *create* the file, and nothing short of driving the real function
+/// proves that.
+///
+/// Lives in its own module because `set_search_path` mutates process-global
+/// libgit2 state. It's safe here: every other test sets a *local* identity via
+/// `repo_with_identity`, so none of them read the global level, and pointing it
+/// at a temp dir only makes the suite more hermetic. A future test that relies
+/// on the developer's real global config would be order-dependent — set a local
+/// identity instead.
+#[cfg(test)]
+mod global_identity_tests {
+    #[test]
+    fn saves_identity_when_the_machine_has_no_gitconfig() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // SAFETY: process-global; see the module comment for why that's OK here.
+        unsafe {
+            git2::opts::set_search_path(git2::ConfigLevel::Global, dir.path()).unwrap();
+        }
+        let expected = dir.path().join(".gitconfig");
+        assert!(!expected.exists(), "precondition: no global config yet");
+
+        super::set_git_identity("Ada Lovelace", "ada@example.com").unwrap();
+
+        assert!(expected.exists(), "saving must create ~/.gitconfig");
+        let written = std::fs::read_to_string(&expected).unwrap();
+        assert!(written.contains("name = Ada Lovelace"), "got: {written}");
+        assert!(
+            written.contains("email = ada@example.com"),
+            "got: {written}"
+        );
+
+        // And the app reads back what it just wrote — this is what unblocks the
+        // commit that triggered the prompt.
+        let id = super::git_identity();
+        assert_eq!(id.name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(id.email.as_deref(), Some("ada@example.com"));
     }
 }

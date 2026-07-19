@@ -22,6 +22,9 @@ export function SecretGuardDialog() {
   const override = useAppStore((s) => s.confirmOverrideCommit);
   const ignoreSecrets = useAppStore((s) => s.ignoreSecrets);
   const busy = useAppStore((s) => s.busy);
+  // Amend is gated too; say which write is being blocked rather than always
+  // saying "commit", so the dialog matches the button the user pressed.
+  const isAmend = useAppStore((s) => s.secretGuardAction === "amend");
 
   const [phrase, setPhrase] = useState("");
 
@@ -50,8 +53,9 @@ export function SecretGuardDialog() {
             </h2>
             <p className="mt-0.5 text-sm text-content-muted">
               GitGlass found {findings.length} thing{findings.length === 1 ? "" : "s"} that look like
-              API keys, tokens, or passwords in what you’re about to save. Committing these could
-              expose them publicly.
+              API keys, tokens, or passwords in what you’re about to save.{" "}
+              {isAmend ? "Folding these into your last commit" : "Committing these"} could expose
+              them publicly.
             </p>
           </div>
         </div>
@@ -81,7 +85,7 @@ export function SecretGuardDialog() {
 
           <details className="group rounded-lg border border-white/10 p-3">
             <summary className="cursor-pointer select-none text-xs font-medium text-content-muted">
-              I understand the risk — let me commit anyway
+              I understand the risk — let me {isAmend ? "amend" : "commit"} anyway
             </summary>
             <div className="mt-3">
               <p className="mb-2 text-xs text-content-muted">
@@ -106,7 +110,7 @@ export function SecretGuardDialog() {
                       : "cursor-not-allowed bg-surface-2 text-content-faint",
                   )}
                 >
-                  {busy ? "Saving…" : "Commit anyway"}
+                  {busy ? "Saving…" : isAmend ? "Amend anyway" : "Commit anyway"}
                 </button>
               </div>
             </div>

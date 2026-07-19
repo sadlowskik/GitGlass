@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import clsx from "clsx";
 import type { DirEntry } from "@/lib/types";
 import { useAppStore } from "@/store/useAppStore";
@@ -26,10 +26,31 @@ function isStageable(entry: DirEntry): boolean {
   return s === "modified" || s === "untracked" || s === "conflict" || s === "staged";
 }
 
-export function FileRow({ entry }: { entry: DirEntry }) {
+/**
+ * Rows only depend on their entry and on store slices whose identity is stable,
+ * so a listing refresh that didn't actually change a row shouldn't re-render it.
+ * Reference equality isn't enough: every refresh deserializes fresh entry
+ * objects over IPC, so the comparator looks at the fields the row renders.
+ * `modifiedMs` is deliberately not compared — nothing displays it, and a touched
+ * mtime alone shouldn't cost a re-render.
+ */
+function sameEntry(a: DirEntry, b: DirEntry): boolean {
+  return (
+    a.path === b.path &&
+    a.name === b.name &&
+    a.isDir === b.isDir &&
+    a.isSymlink === b.isSymlink &&
+    a.sizeBytes === b.sizeBytes &&
+    a.gitStatus === b.gitStatus &&
+    a.hasChanges === b.hasChanges
+  );
+}
+
+export const FileRow = memo(function FileRow({ entry }: { entry: DirEntry }) {
   const navigate = useAppStore((s) => s.navigate);
   const stage = useAppStore((s) => s.stage);
   const unstage = useAppStore((s) => s.unstage);
+  const requestDiscard = useAppStore((s) => s.requestDiscard);
   const notify = useAppStore((s) => s.notify);
   const openDiff = useAppStore((s) => s.openDiff);
   const inRepo = useAppStore((s) => !!s.listing?.repo);
@@ -71,6 +92,15 @@ export function FileRow({ entry }: { entry: DirEntry }) {
       onClick: () =>
         void api.revealInOs(entry.path).catch((e) => notify({ kind: "error", title: (e as { message?: string })?.message ?? "Couldn’t reveal item" })),
     });
+    // Discard only makes sense for tracked changes (there's a HEAD version to
+    // restore to). Untracked files have nothing to restore, so we don't offer it.
+    if (entry.gitStatus && ["modified", "staged", "conflict"].includes(entry.gitStatus)) {
+      items.push({
+        label: "Discard changes",
+        danger: true,
+        onClick: () => requestDiscard([entry.path]),
+      });
+    }
     return items;
   };
 
@@ -140,4 +170,4 @@ export function FileRow({ entry }: { entry: DirEntry }) {
       )}
     </>
   );
-}
+}, (prev, next) => sameEntry(prev.entry, next.entry));

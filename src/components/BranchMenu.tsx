@@ -21,6 +21,7 @@ export function BranchMenu() {
   const [busy, setBusy] = useState(false);
   const [newName, setNewName] = useState("");
   const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
   if (!repo?.branch) return null;
   const root = repo.root;
@@ -84,14 +85,21 @@ export function BranchMenu() {
     }
   };
 
-  const onDelete = async (name: string) => {
+  const onDelete = async (name: string, force = false) => {
     setBusy(true);
     try {
-      await api.deleteBranch(root, name);
+      await api.deleteBranch(root, name, force);
+      setPendingDelete(null);
       await load();
       notify({ kind: "info", title: `Deleted ${name}` });
     } catch (e) {
-      err(e);
+      // Unmerged branches are refused once; escalate to an explicit confirm
+      // instead of silently force-deleting (which would orphan commits).
+      if ((e as AppError)?.kind === "unmerged_branch") {
+        setPendingDelete(name);
+      } else {
+        err(e);
+      }
     } finally {
       setBusy(false);
     }
@@ -133,6 +141,29 @@ export function BranchMenu() {
                     className="rounded-lg bg-accent px-2.5 py-1 text-xs font-medium text-white hover:opacity-90 disabled:opacity-50"
                   >
                     Switch
+                  </button>
+                </div>
+              </div>
+            ) : pendingDelete ? (
+              <div className="p-2">
+                <p className="mb-2 text-xs text-content-muted">
+                  <span className="mono text-content-strong">{pendingDelete}</span> has commits
+                  that aren’t on your current branch or pushed anywhere. Deleting it{" "}
+                  <span className="text-git-conflict">discards those commits for good.</span>
+                </p>
+                <div className="flex justify-end gap-2">
+                  <button
+                    onClick={() => setPendingDelete(null)}
+                    className="rounded-lg px-2.5 py-1 text-xs text-content-muted hover:bg-surface-2"
+                  >
+                    Keep it
+                  </button>
+                  <button
+                    onClick={() => void onDelete(pendingDelete, true)}
+                    disabled={busy}
+                    className="rounded-lg bg-git-conflict px-2.5 py-1 text-xs font-medium text-white hover:brightness-110 disabled:opacity-50"
+                  >
+                    Delete anyway
                   </button>
                 </div>
               </div>

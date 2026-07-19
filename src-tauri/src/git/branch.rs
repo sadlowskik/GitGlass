@@ -89,8 +89,12 @@ pub fn switch_branch(repo_path: &Path, name: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Delete a local branch. Refuses to delete the branch you're currently on.
-pub fn delete_branch(repo_path: &Path, name: &str) -> AppResult<()> {
+/// Delete a local branch. Refuses to delete the branch you're currently on, and
+/// — unless `force` — refuses a branch with commits that aren't merged into the
+/// current branch or pushed to its upstream. That mirrors `git branch -d` (which
+/// protects unmerged work) vs `-D` (which forces); GitGlass previously always
+/// force-deleted, silently orphaning commits.
+pub fn delete_branch(repo_path: &Path, name: &str, force: bool) -> AppResult<()> {
     let repo = open_repo(repo_path)?;
     let mut branch = repo.find_branch(name, BranchType::Local)?;
     if branch.is_head() {
@@ -99,8 +103,46 @@ pub fn delete_branch(repo_path: &Path, name: &str) -> AppResult<()> {
             "You can’t delete the branch you’re currently on. Switch to another branch first.",
         ));
     }
+    if !force && !branch_is_merged(&repo, &branch) {
+        return Err(AppError::new(
+            ErrorKind::UnmergedBranch,
+            format!(
+                "“{name}” has commits that aren’t on your current branch or pushed anywhere. Deleting it discards them for good."
+            ),
+        ));
+    }
     branch.delete()?;
     Ok(())
+}
+
+/// Whether every commit on `branch` is already reachable from the current HEAD
+/// (merged in) or from the branch's own upstream (pushed) — i.e. deleting it
+/// loses nothing. Conservative: any uncertainty returns `false` (treat as
+/// unmerged) so we err toward protecting the user's commits.
+fn branch_is_merged(repo: &Repository, branch: &git2::Branch) -> bool {
+    let Some(tip) = branch.get().target() else {
+        // A branch with no target has no commits to lose.
+        return true;
+    };
+    let reachable_from =
+        |oid: git2::Oid| oid == tip || repo.graph_descendant_of(oid, tip).unwrap_or(false);
+    // Merged into the branch we're on?
+    if let Ok(head) = repo.head() {
+        if let Some(head_oid) = head.target() {
+            if reachable_from(head_oid) {
+                return true;
+            }
+        }
+    }
+    // Or already pushed (reachable from its upstream)?
+    if let Ok(upstream) = branch.upstream() {
+        if let Some(up_oid) = upstream.get().target() {
+            if reachable_from(up_oid) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn branch_refname(repo: &Repository, name: &str) -> AppResult<String> {
@@ -146,9 +188,10 @@ mod tests {
         assert!(feature.is_current, "should have switched to the new branch");
 
         // Can't delete the branch we're on.
-        assert!(delete_branch(&root, "feature").is_err());
+        assert!(delete_branch(&root, "feature", false).is_err());
 
-        // Switch back to the default, then delete feature.
+        // Switch back to the default, then delete feature. It has no commits of
+        // its own (created at the same tip), so it's "merged" — no force needed.
         let default = branches
             .iter()
             .find(|b| !b.is_current)
@@ -156,7 +199,7 @@ mod tests {
             .name
             .clone();
         switch_branch(&root, &default).unwrap();
-        delete_branch(&root, "feature").unwrap();
+        delete_branch(&root, "feature", false).unwrap();
         assert!(list_branches(&root)
             .unwrap()
             .iter()
@@ -169,5 +212,55 @@ mod tests {
         create_branch(&root, "dup", false).unwrap();
         let err = create_branch(&root, "dup", false).unwrap_err();
         assert!(matches!(err.kind, ErrorKind::Git));
+    }
+
+    #[test]
+    fn deleting_an_unmerged_branch_is_refused_without_force() {
+        let (_d, root) = repo_with_commit();
+        create_branch(&root, "feature", true).unwrap();
+        // Put a commit on `feature` that exists nowhere else.
+        fs::write(root.join("new.txt"), "unmerged work").unwrap();
+        crate::git::ops::stage_paths(&root, &[root.join("new.txt").to_string_lossy().to_string()])
+            .unwrap();
+        crate::git::ops::commit(&root, "unmerged commit").unwrap();
+
+        // Switch away, then try to delete without force → refused.
+        let default = list_branches(&root)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.name != "feature")
+            .unwrap()
+            .name;
+        switch_branch(&root, &default).unwrap();
+
+        let err = delete_branch(&root, "feature", false).unwrap_err();
+        assert!(
+            matches!(err.kind, ErrorKind::UnmergedBranch),
+            "kind: {:?}",
+            err.kind
+        );
+        assert!(list_branches(&root)
+            .unwrap()
+            .iter()
+            .any(|b| b.name == "feature"));
+
+        // Forcing it through succeeds.
+        delete_branch(&root, "feature", true).unwrap();
+        assert!(list_branches(&root)
+            .unwrap()
+            .iter()
+            .all(|b| b.name != "feature"));
+    }
+
+    #[test]
+    fn deleting_a_merged_branch_needs_no_force() {
+        let (_d, root) = repo_with_commit();
+        // Branch at the current tip, add no commits → fully merged.
+        create_branch(&root, "topic", false).unwrap();
+        delete_branch(&root, "topic", false).unwrap();
+        assert!(list_branches(&root)
+            .unwrap()
+            .iter()
+            .all(|b| b.name != "topic"));
     }
 }

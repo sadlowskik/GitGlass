@@ -1,14 +1,17 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use git2::{
-    build::RepoBuilder, BranchType, Cred, FetchOptions, IndexAddOption, PushOptions,
-    RemoteCallbacks, Repository, Signature,
+    build::RepoBuilder, FetchOptions, IndexAddOption, PushOptions, RemoteCallbacks, Repository,
+    Signature,
 };
 use serde::Serialize;
 
 use crate::error::{AppError, AppResult, ErrorKind};
-use crate::git::ops::open_repo;
+use crate::git::ops::{open_repo, set_tracking};
 
+use super::url::{is_github_token_url, parse_owner_repo, token_credentials};
 use super::{api, auth};
 
 #[derive(Serialize)]
@@ -22,23 +25,6 @@ pub struct PublishResult {
 pub struct PrResult {
     pub html_url: String,
     pub number: u64,
-}
-
-/// Parse `owner` and `repo` out of a GitHub remote URL (https or ssh forms).
-pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
-    let u = url.trim().trim_end_matches('/').trim_end_matches(".git");
-    let rest = u
-        .strip_prefix("https://github.com/")
-        .or_else(|| u.strip_prefix("http://github.com/"))
-        .or_else(|| u.strip_prefix("git@github.com:"))
-        .or_else(|| u.find("github.com/").map(|i| &u[i + "github.com/".len()..]))?;
-    let mut parts = rest.splitn(2, '/');
-    let owner = parts.next()?.to_string();
-    let repo = parts.next()?.trim_end_matches('/').to_string();
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((owner, repo))
 }
 
 fn current_branch(repo: &git2::Repository) -> AppResult<String> {
@@ -77,8 +63,7 @@ fn origin_owner_repo(repo_path: &Path) -> AppResult<(String, String)> {
 
 fn token_callbacks(token: String) -> RemoteCallbacks<'static> {
     let mut cb = RemoteCallbacks::new();
-    // GitHub accepts the token as the username with an empty password.
-    cb.credentials(move |_url, _user, _allowed| Cred::userpass_plaintext(&token, ""));
+    cb.credentials(token_credentials(token));
     cb
 }
 
@@ -98,21 +83,82 @@ fn set_origin_and_push(
     }
 
     let mut remote = repo.find_remote("origin")?;
+
+    // The remote reports per-ref rejections through this callback rather than as
+    // a returned Err. Without capturing it, a rejected push looks like success
+    // and leaves an empty repo on GitHub.
+    let rejection: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let rejection_cb = rejection.clone();
+
+    let mut callbacks = token_callbacks(token.to_string());
+    callbacks.push_update_reference(move |_refname, status| {
+        if let Some(msg) = status {
+            *rejection_cb.borrow_mut() = Some(msg.to_string());
+        }
+        Ok(())
+    });
+
     let mut opts = PushOptions::new();
-    opts.remote_callbacks(token_callbacks(token.to_string()));
+    opts.remote_callbacks(callbacks);
     let refspec = format!("refs/heads/{b}:refs/heads/{b}", b = branch);
     // Don't let a push failure surface as the generic "couldn't read Git data".
     remote.push(&[&refspec], Some(&mut opts)).map_err(|e| {
+        let kind = if e.code() == git2::ErrorCode::Auth {
+            ErrorKind::Auth
+        } else {
+            ErrorKind::Git
+        };
         AppError::new(
-            ErrorKind::Git,
+            kind,
             "GitGlass created the repository on GitHub but couldn’t upload your files.",
         )
         .with_detail(e.to_string())
     })?;
 
-    // Track origin/<branch> so sync state ("ahead/behind") works afterwards.
-    let mut local = repo.find_branch(branch, BranchType::Local)?;
-    local.set_upstream(Some(&format!("origin/{branch}")))?;
+    if let Some(msg) = rejection.borrow().clone() {
+        return Err(crate::git::sync::push_rejection_error(&msg));
+    }
+
+    set_tracking(&repo, "origin", branch, "GitGlass: publish");
+    Ok(())
+}
+
+/// Point `origin` at an existing GitHub repo, creating nothing on GitHub. Unlike
+/// `publish` (which creates a new repo), this links a local folder to a repo that
+/// already exists. The URL is validated as GitHub so `origin` never gets wired to
+/// junk — and so the stored token is only ever offered to github.com.
+///
+/// After wiring the URL it fetches and sets up branch tracking (best-effort), so
+/// "ahead / behind" works right away rather than staying blank until the first
+/// push. An offline connect still succeeds; tracking is established later.
+pub async fn set_origin(repo_path: &Path, url: &str) -> AppResult<()> {
+    let url = url.trim().to_string();
+    let repo_path = repo_path.to_path_buf();
+    run_blocking(move || {
+        set_origin_url(&repo_path, &url)?;
+        // Best-effort — must not fail the connect if the remote is unreachable.
+        let _ = crate::git::sync::fetch_and_track_origin(&repo_path);
+        Ok(())
+    })
+    .await
+}
+
+/// Validate the URL as GitHub and set/replace `origin`. Split out so the
+/// validation + wiring is unit-testable without the async fetch.
+fn set_origin_url(repo_path: &Path, url: &str) -> AppResult<()> {
+    let url = url.trim();
+    parse_owner_repo(url).ok_or_else(|| {
+        AppError::new(
+            ErrorKind::NotFound,
+            "That doesn’t look like a GitHub repository URL (e.g. https://github.com/owner/repo).",
+        )
+    })?;
+    let repo = open_repo(repo_path)?;
+    if repo.find_remote("origin").is_ok() {
+        repo.remote_set_url("origin", url)?;
+    } else {
+        repo.remote("origin", url)?;
+    }
     Ok(())
 }
 
@@ -168,6 +214,25 @@ fn ensure_repo_inner(
 
     // Already has history — just report the current branch.
     if repo.head().is_ok() {
+        // The staged-diff gate further down only ever runs on an unborn branch,
+        // so without this a folder that already had commits was published with
+        // no scan at all — while the dialog said publishing was blocked until
+        // secrets were removed. Scan the working tree here: `scan_staged` would
+        // see an empty diff and wave it through.
+        //
+        // Limitation, deliberately not papered over: this covers the working
+        // tree, not history. A secret that was committed and later deleted is
+        // still in the objects being pushed and will not be caught here.
+        if !allow_secrets {
+            let findings = crate::secret_scan::scan_folder(folder)?;
+            if !findings.is_empty() {
+                return Err(AppError::new(
+                    ErrorKind::SecretsFound,
+                    "This folder looks like it contains secrets. Review and remove them (or add a .gitignore) before publishing.",
+                )
+                .with_detail(format!("{} suspected secret(s) found.", findings.len())));
+            }
+        }
         return current_branch(&repo);
     }
 
@@ -253,14 +318,21 @@ pub async fn publish(
 
 /// Clone a repository by URL into `dest`. Uses the stored token when present so
 /// private repos work; public clones succeed without one.
+///
+/// The URL comes straight from the user (paste box), so it is not trusted: the
+/// token is offered only when the host really is GitHub. Cloning elsewhere is
+/// still allowed — it just proceeds unauthenticated rather than handing the
+/// user's `repo`-scoped token to whoever owns that domain.
 pub async fn clone(url: &str, dest: &Path) -> AppResult<PathBuf> {
-    let token = auth::read_token();
+    let token = auth::read_token().filter(|_| is_github_token_url(url));
     let url = url.to_string();
     let dest = dest.to_path_buf();
     run_blocking(move || {
         let mut cbs = RemoteCallbacks::new();
         if let Some(t) = token {
-            cbs.credentials(move |_u, _user, _a| Cred::userpass_plaintext(&t, ""));
+            // Re-checks the host on each callback, so a github.com URL that
+            // redirects off-site still can't collect the token.
+            cbs.credentials(token_credentials(t));
         }
         let mut fo = FetchOptions::new();
         fo.remote_callbacks(cbs);
@@ -378,6 +450,46 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn set_origin_accepts_a_github_url_and_wires_origin() {
+        let dir = TempDir::new().unwrap();
+        Repository::init(dir.path()).unwrap();
+
+        set_origin_url(dir.path(), "https://github.com/owner/repo.git").unwrap();
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let origin = repo.find_remote("origin").unwrap();
+        assert_eq!(origin.url(), Some("https://github.com/owner/repo.git"));
+    }
+
+    #[test]
+    fn set_origin_rejects_a_non_github_url() {
+        let dir = TempDir::new().unwrap();
+        Repository::init(dir.path()).unwrap();
+
+        let err = set_origin_url(dir.path(), "https://evil.example/owner/repo.git").unwrap_err();
+        assert!(matches!(err.kind, ErrorKind::NotFound));
+        // Nothing should have been wired up.
+        let repo = Repository::open(dir.path()).unwrap();
+        assert!(repo.find_remote("origin").is_err());
+    }
+
+    #[test]
+    fn set_origin_updates_an_existing_origin() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.remote("origin", "https://github.com/old/old.git")
+            .unwrap();
+
+        set_origin_url(dir.path(), "https://github.com/new/new.git").unwrap();
+
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(
+            repo.find_remote("origin").unwrap().url(),
+            Some("https://github.com/new/new.git")
+        );
+    }
+
+    #[test]
     fn ensure_repo_initializes_a_plain_folder() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("readme.txt"), "hello world").unwrap();
@@ -430,6 +542,66 @@ mod tests {
         // With the override, the same folder publishes past the gate.
         let ok = ensure_repo_with_commit(dir.path(), "T", "t@e.com", true);
         assert!(ok.is_ok(), "override should skip the secret gate");
+    }
+
+    /// The gate above only ever ran on an unborn branch. A folder that already
+    /// had commits returned early, so publishing an existing repo — history and
+    /// all — did no secret scanning whatsoever, while the dialog told the user
+    /// publishing was blocked until secrets were removed.
+    #[test]
+    fn ensure_repo_blocks_secrets_when_the_repo_already_has_commits() {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+
+        // A real first commit, so `repo.head()` succeeds and we take the early
+        // return path.
+        fs::write(dir.path().join("readme.md"), "hello").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("readme.md")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@e.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        drop(index);
+        drop(tree);
+
+        // Now drop a secret into the working tree, uncommitted and unstaged —
+        // exactly what `scan_staged` cannot see.
+        fs::write(
+            dir.path().join("config.txt"),
+            "aws_key=AKIA1234567890ABCDEF",
+        )
+        .unwrap();
+
+        let err = ensure_repo_with_commit(dir.path(), "T", "t@e.com", false).unwrap_err();
+        assert!(
+            matches!(err.kind, crate::error::ErrorKind::SecretsFound),
+            "expected SecretsFound, got {:?}",
+            err.kind
+        );
+
+        // And the typed override still gets through.
+        assert!(ensure_repo_with_commit(dir.path(), "T", "t@e.com", true).is_ok());
+    }
+
+    /// Guard against the fix over-blocking: a clean existing repo must publish.
+    #[test]
+    fn ensure_repo_allows_a_clean_repo_that_already_has_commits() {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("main.py"), "print('hello')\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("main.py")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@e.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        drop(index);
+        drop(tree);
+
+        assert!(ensure_repo_with_commit(dir.path(), "T", "t@e.com", false).is_ok());
     }
 
     #[test]

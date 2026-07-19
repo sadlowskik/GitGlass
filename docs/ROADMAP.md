@@ -21,6 +21,12 @@ Milestones are cumulative. **No feature ships without its error states designed.
 - [x] Toast system for action feedback; errors keep the never-show-raw contract
 - [x] Error states: empty message, nothing-to-commit, no-identity, no-upstream,
       non-fast-forward → "pull first", auth-failed (friendly)
+- [x] **No-identity is recoverable in-app** (2026-07-16): the M2 error *state*
+      existed, but its only remedy was `git config` in a terminal — a dead end
+      for a "no command line required" product. A failed save now opens a dialog
+      that writes name/email to the **global** Git config via git2 and resumes
+      the commit. Prefilled from the GitHub login + `@users.noreply.github.com`.
+      Reminder that an error state isn't designed until it has a way *out*.
 - [x] Tests: stage→commit roundtrip, unstage, nothing-staged, empty message,
       path relativize (false-prefix guard, repo-root → match-all)
 - Notes: push/pull network auth bridges through the user's existing Git
@@ -57,6 +63,31 @@ Milestones are cumulative. **No feature ships without its error states designed.
       disclosure — no raw git strings anywhere.
 - [x] Tests: branch create/switch/delete roundtrip, duplicate-name error
       (30 Rust tests total).
+
+## M5.1 — Sync hardening & operation parity (2026-07-17) ✅ built
+Closing gaps found in a Git/GitHub audit. Each shipped with tests.
+- [x] **Pull no longer discards uncommitted work.** It was doing a *force*
+      checkout on fast-forward, silently overwriting local edits (proven with a
+      repro). Now a **safe** checkout that refuses — "commit or discard first" —
+      exactly like `git pull`. Regression tests: clean FF, conflicting edit
+      refused+preserved, unrelated edit preserved.
+- [x] **Fetch** (manual, toolbar button): refreshes remote-tracking refs so
+      "N behind" is real without a pull. No background auto-fetch — that would
+      break the [zero-background-network](SECURITY.md) promise; fetch is
+      user-driven.
+- [x] **Discard changes** (file context menu → confirm dialog): restores a file
+      to HEAD (reverts edits, restores deletions). Untracked files are left alone.
+- [x] **Amend last commit** (commit panel): folds staged changes into the last
+      commit; blank message keeps the original. **Refuses once the commit is on
+      the remote** (won't rewrite shared history).
+- [x] **Tag sync:** push publishes local tags (best-effort); fetch/pull download
+      tags — so version/release tags are visible both ways.
+- [x] **Connect to existing GitHub repo:** sets `origin` to an existing repo
+      (Publish only ever *created* a new one). URL validated as GitHub.
+- [x] **Sign-in survives network blips:** a transient API failure keeps you
+      signed in with your cached identity; only a real 401/403 shows signed-out.
+- Still deferred (by design): in-app **merge/conflict resolution** for diverged
+      pulls stays a friendly error for now.
 
 ## Shippable (v1.0)
 - Real Windows Authenticode cert wired into CI; **macOS notarization**

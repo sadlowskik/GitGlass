@@ -14,7 +14,7 @@ import { useAppStore } from "./useAppStore";
 
 const CLIENT_ID = (import.meta.env.VITE_GITHUB_CLIENT_ID as string | undefined) ?? "";
 
-type Dialog = null | "signin" | "publish" | "clone" | "pr" | "release";
+type Dialog = null | "signin" | "publish" | "clone" | "connect" | "pr" | "release";
 
 interface GithubState {
   status: AuthStatus;
@@ -56,6 +56,7 @@ interface GithubState {
     allowSecrets: boolean,
   ) => Promise<void>;
   clone: (url: string, dest: string) => Promise<void>;
+  connectOrigin: (url: string) => Promise<void>;
   openPr: (title: string, body: string) => Promise<void>;
   createRelease: (tag: string) => Promise<void>;
   refreshLists: () => Promise<void>;
@@ -253,6 +254,26 @@ export const useGithubStore = create<GithubState>((set, get) => ({
     }
   },
 
+  connectOrigin: async (url) => {
+    const repo = useAppStore.getState().listing?.repo?.root;
+    if (!repo) {
+      notify({ kind: "error", title: "Open a Git repository first." });
+      return;
+    }
+    set({ busy: true });
+    try {
+      await api.githubSetOrigin(repo, url);
+      set({ dialog: null });
+      notify({ kind: "success", title: "Connected to GitHub" });
+      await useAppStore.getState().refresh();
+      void get().refreshLists();
+    } catch (e) {
+      notify({ kind: "error", title: errText(e), detail: (e as AppError)?.detail });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
   openPr: async (title, body) => {
     const repo = useAppStore.getState().listing?.repo?.root;
     if (!repo) return;
@@ -277,9 +298,12 @@ export const useGithubStore = create<GithubState>((set, get) => ({
     try {
       const actionsUrl = await api.githubCreateRelease(repo, tag);
       set({ dialog: null });
+      // Honest wording: tagging always succeeds, but a build only happens if the
+      // repo has a release workflow. We open Actions so the user can see whether
+      // one actually ran, rather than promising installers that may never build.
       notify({
         kind: "success",
-        title: `Release ${tag} started — building Windows & Mac installers`,
+        title: `Tagged ${tag} — opening Actions to check for a build`,
       });
       void get().open(actionsUrl);
     } catch (e) {
@@ -320,6 +344,24 @@ export const useGithubStore = create<GithubState>((set, get) => ({
   },
 }));
 
+/**
+ * Whether a remote URL really points at github.com.
+ *
+ * Substring matching says yes to `https://github.com@evil.example/x` and
+ * `https://evil.example/github.com/x`, so compare the parsed host instead.
+ * This only gates which buttons appear — the Rust side independently refuses
+ * to hand the token to a non-GitHub host — but the two checks must agree, or
+ * the UI offers GitHub actions the backend will reject.
+ */
 export function isGithub(url: string | null | undefined): boolean {
-  return !!url && url.includes("github.com");
+  if (!url) return false;
+  const trimmed = url.trim();
+  // scp-like syntax (`git@github.com:owner/repo.git`) isn't a parseable URL.
+  const scp = /^[^/]*@([^:/]+):/.exec(trimmed);
+  if (scp) return scp[1].toLowerCase() === "github.com";
+  try {
+    return new URL(trimmed).hostname.toLowerCase() === "github.com";
+  } catch {
+    return false;
+  }
 }

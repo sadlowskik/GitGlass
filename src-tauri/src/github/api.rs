@@ -51,9 +51,44 @@ async fn check(resp: reqwest::Response) -> AppResult<reqwest::Response> {
             ErrorKind::Git,
             "GitHub rejected the request — the name may already be taken.",
         ),
+        429 => (
+            ErrorKind::Io,
+            "GitHub is asking GitGlass to slow down. Wait a minute, then try again.",
+        ),
+        // GitHub's own outages and degraded spells land here. Nothing the user
+        // did is wrong and nothing they change will help, so say that instead
+        // of calling it "unexpected" and inviting them to hunt for a mistake.
+        500..=599 => (
+            ErrorKind::Io,
+            "GitHub is having trouble on their end right now — nothing’s wrong with your repo. Check githubstatus.com, then try again in a few minutes.",
+        ),
         _ => (ErrorKind::Io, "GitHub returned an unexpected error."),
     };
-    Err(AppError::new(kind, msg).with_detail(format!("HTTP {status}: {body}")))
+    Err(AppError::new(kind, msg).with_detail(describe_body(status, &body)))
+}
+
+/// Summarize a failed response for the details disclosure.
+///
+/// API errors come back as small JSON blobs worth showing verbatim, but during
+/// an outage GitHub's edge serves a full HTML error page instead. Pasting that
+/// page into the UI buries the status line in markup, so HTML is reduced to the
+/// one fact it carries — and any body is capped, since `detail` is a disclosure
+/// line, not a log viewer.
+fn describe_body(status: reqwest::StatusCode, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return format!("HTTP {status} (empty response body)");
+    }
+    if body.starts_with('<') {
+        return format!("HTTP {status} — GitHub returned an HTML error page, not an API response. This is a GitHub-side outage rather than a problem with the request.");
+    }
+    const MAX: usize = 500;
+    if body.chars().count() > MAX {
+        // Truncate by chars, not bytes: the body is UTF-8 and slicing mid-codepoint panics.
+        let head: String = body.chars().take(MAX).collect();
+        return format!("HTTP {status}: {head}…");
+    }
+    format!("HTTP {status}: {body}")
 }
 
 #[derive(Deserialize)]
@@ -468,4 +503,63 @@ pub async fn list_issues(token: &str, owner: &str, repo: &str) -> AppResult<Vec<
         .filter(|i| i.pull_request.is_none())
         .map(Into::into)
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    /// The exact body GitHub served during the outage that produced the
+    /// "GitHub returned an unexpected error" toast: a full HTML error page.
+    const GITHUB_HTML_ERROR_PAGE: &str = r#"<!DOCTYPE html>
+<html>
+<!--
+  Hello future GitHubber! I bet you're excited to DRY up these templates and make 'em
+-->
+<head><title>Server Error</title></head>
+<body><div>Unicorn!</div></body>
+</html>"#;
+
+    #[test]
+    fn html_error_page_is_summarized_not_dumped() {
+        let out = describe_body(StatusCode::SERVICE_UNAVAILABLE, GITHUB_HTML_ERROR_PAGE);
+        assert!(out.contains("503"));
+        // The markup itself must not reach the UI.
+        assert!(!out.contains("<!DOCTYPE"));
+        assert!(!out.contains("Hello future GitHubber"));
+        assert!(out.contains("outage"));
+    }
+
+    #[test]
+    fn json_error_body_is_kept_verbatim() {
+        let body = r#"{"message":"Not Found","status":"404"}"#;
+        let out = describe_body(StatusCode::NOT_FOUND, body);
+        assert_eq!(out, format!("HTTP 404 Not Found: {body}"));
+    }
+
+    #[test]
+    fn long_body_is_truncated_and_marked() {
+        let body = "x".repeat(5_000);
+        let out = describe_body(StatusCode::BAD_GATEWAY, &body);
+        assert!(
+            out.chars().count() < 700,
+            "detail was not capped: {}",
+            out.chars().count()
+        );
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn multibyte_body_truncates_without_panicking() {
+        // Slicing this by byte index would panic mid-codepoint.
+        let body = "é".repeat(5_000);
+        let out = describe_body(StatusCode::BAD_GATEWAY, &body);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn empty_body_says_so() {
+        assert!(describe_body(StatusCode::SERVICE_UNAVAILABLE, "   ").contains("empty"));
+    }
 }

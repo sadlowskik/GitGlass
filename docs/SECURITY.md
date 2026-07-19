@@ -43,6 +43,33 @@ Credential Manager) via `keyring`, under service `GitGlass` / account
 `github-token`. It is never written to config or `.env`, never logged, and is
 removed on sign-out. See [GITHUB.md](GITHUB.md).
 
+## Who the token may be sent to
+
+Storing the token safely is only half the problem — the other half is never
+handing it to the wrong host. The token carries `repo` and `workflow` scope, so
+leaking it is a full-account compromise.
+
+- **Host, never substring.** `github::url::is_github_token_url` parses the URL
+  and compares the host to `github.com`. `url.contains("github.com")` is *not* a
+  host check: it says yes to `https://github.com@evil.tld/x` (userinfo — the real
+  host is `evil.tld`), `https://github.com.evil.tld/x`, and
+  `https://evil.tld/github.com/x`. All three are covered by tests.
+- **HTTPS only.** The token travels as an HTTP Basic password, so `http://` is
+  refused rather than put on the wire in cleartext.
+- **Re-checked per callback, not once.** libgit2 follows redirects and invokes
+  the credential callback with the URL it actually reached, so a github.com URL
+  that redirects off-site cannot collect the token.
+- **Untrusted input.** Clone URLs are pasted by the user. A non-GitHub clone is
+  allowed but proceeds *unauthenticated*; it never falls back to offering the
+  token. `git::sync` likewise falls through to the user's own credential helper
+  for non-GitHub remotes.
+- The frontend's `isGithub` gate uses the same host comparison. It only decides
+  which buttons appear — the Rust boundary is the one that matters — but the two
+  must agree or the UI offers actions the backend refuses.
+
+Tests drive a real libgit2 fetch against a local server that demands Basic auth
+and assert the token never appears in the bytes it receives.
+
 ## Content Security Policy
 
 The webview runs under a strict CSP (`tauri.conf.json → app.security.csp`):

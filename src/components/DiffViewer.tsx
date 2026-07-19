@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { useAppStore } from "@/store/useAppStore";
 import { api } from "@/lib/tauri";
@@ -20,7 +20,15 @@ export function DiffViewer() {
   const [mode, setMode] = useState<Mode>("unified");
 
   useEffect(() => {
-    if (!diffPath || !repoRoot) return;
+    if (!diffPath || !repoRoot) {
+      // Release the last diff when the viewer closes. This component is mounted
+      // unconditionally by App, so returning early without clearing kept the
+      // whole FileDiff — every line, with its content string — alive in the
+      // webview for the rest of the session.
+      setDiff(null);
+      setError(null);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -93,6 +101,11 @@ export function DiffViewer() {
                   <SplitHunk key={i} hunk={hunk} lang={lang} />
                 ),
               )}
+              {diff.truncated && (
+                <div className="border-t border-white/10 bg-git-modified/10 px-3 py-2 text-xs text-git-modified">
+                  This file has more changes than we can show at once — the rest are hidden.
+                </div>
+              )}
             </>
           )}
         </div>
@@ -131,9 +144,22 @@ function Centered({ children, className }: { children: React.ReactNode; classNam
   );
 }
 
-function Code({ content, lang }: { content: string; lang: string | undefined }) {
-  return <span dangerouslySetInnerHTML={{ __html: highlightLine(content, lang) || "​" }} />;
-}
+/**
+ * Highlighting is the expensive part of rendering a diff, and it was re-running
+ * for every line on every render — including the unified/split toggle, which
+ * re-highlighted the entire file synchronously. Memoized per line so a re-render
+ * that doesn't change the content is free.
+ */
+const Code = memo(function Code({
+  content,
+  lang,
+}: {
+  content: string;
+  lang: string | undefined;
+}) {
+  const html = useMemo(() => highlightLine(content, lang) || "​", [content, lang]);
+  return <span dangerouslySetInnerHTML={{ __html: html }} />;
+});
 
 function bg(origin: DiffLine["origin"]): string {
   if (origin === "add") return "bg-git-staged/10";

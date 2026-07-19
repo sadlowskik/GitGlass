@@ -150,10 +150,46 @@ pub fn scan_staged(repo_path: &Path) -> AppResult<Vec<Finding>> {
     Ok(out)
 }
 
-/// Directories skipped when scanning a whole folder — dependency/build/venv
-/// noise that isn't the user's own code.
-const SCAN_SKIP_DIRS: &[&str] = &[
+/// The enforcement point for anything that turns the staged tree into a commit.
+///
+/// Both `commit` and `amend_commit` call this. It exists as one function rather
+/// than two copies of the same block because the copies drifted: amend shipped
+/// with no gate at all, so staging a key and pressing "Amend last commit" — the
+/// button beside Save, in the same panel — committed it unscanned.
+///
+/// `allow_secrets` is only ever true after the user types the confirmation
+/// phrase in the UI. This runs even when a caller skipped the pre-scan, so it
+/// holds regardless of what the frontend did.
+pub fn gate(repo_path: &Path, allow_secrets: bool) -> AppResult<()> {
+    if allow_secrets {
+        return Ok(());
+    }
+    let findings = scan_staged(repo_path)?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::AppError::new(
+        crate::error::ErrorKind::SecretsFound,
+        "Blocked: these changes look like they contain secrets.",
+    )
+    .with_detail(format!("{} suspected secret(s) found.", findings.len())))
+}
+
+/// Directories that hold machine-generated output rather than the user's own
+/// work: dependency trees, build artifacts, virtualenvs, VCS internals.
+///
+/// Shared with the file watcher (`crate::watcher`), which skips the same set —
+/// both are answering the same question, and one list means they can't drift
+/// apart. Names are matched as whole path components, never as substrings.
+///
+/// Deliberately NOT listed: `.github`, `.vscode`, `.idea`, `.terraform` and
+/// other dot-directories that hold hand-written config, because those really
+/// can contain credentials. Only entries that are reproducible from source
+/// belong here.
+pub(crate) const SCAN_SKIP_DIRS: &[&str] = &[
     ".git",
+    ".hg",
+    ".svn",
     "node_modules",
     "target",
     "dist",
@@ -164,6 +200,8 @@ const SCAN_SKIP_DIRS: &[&str] = &[
     "__pycache__",
     ".mypy_cache",
     ".pytest_cache",
+    ".tox",
+    ".gradle",
     "site-packages",
     ".next",
     ".cache",
@@ -198,9 +236,11 @@ pub fn scan_folder(root: &Path) -> AppResult<Vec<Finding>> {
             };
             if ft.is_dir() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                // Skip hidden and dependency dirs (dotfiles that are *files*,
-                // like .env, are still scanned).
-                if name.starts_with('.') || SCAN_SKIP_DIRS.contains(&name.as_str()) {
+                // Only skip generated output. This used to skip EVERY directory
+                // starting with '.', which meant a folder holding `.aws/
+                // credentials`, `.ssh/id_rsa` or `.config/gh/hosts.yml` scanned
+                // clean and the publish dialog said "safe to publish".
+                if SCAN_SKIP_DIRS.contains(&name.as_str()) {
                     continue;
                 }
                 if is_ignored(repo.as_ref(), &path) {
@@ -294,12 +334,20 @@ fn scan_line(path: &str, line: u32, content: &str, out: &mut Vec<Finding>) {
     let is_env = is_dotenv(path);
     if let Some(caps) = assignment_re().captures(content) {
         let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        // A `::` path (Rust `CredentialType::USER_PASS_PLAINTEXT`, C++ `Foo::BAR`)
+        // looks like an assignment: the type name matches the key word ("token",
+        // "credential", …), the first colon is read as the operator, and the
+        // second colon lands as the value's first char. The regex crate has no
+        // lookbehind to forbid `::`, so detect it here — a value starting with a
+        // colon is a namespace path, not a secret.
+        let is_path_separator = value.starts_with(':');
         // A real credential has mixed case or digits; an all-lowercase,
         // word-with-underscores value is a placeholder phrase, not a secret.
         let tokenish = value
             .chars()
             .any(|c| c.is_ascii_digit() || c.is_ascii_uppercase());
-        if !is_allowlisted(value)
+        if !is_path_separator
+            && !is_allowlisted(value)
             && value.len() >= 12
             && (is_env || (tokenish && shannon_entropy(value) >= 3.5))
         {
@@ -439,6 +487,101 @@ mod tests {
         assert!(scan_folder(dir.path()).unwrap().is_empty());
     }
 
+    /// Dot-directories used to be skipped wholesale, so a folder carrying
+    /// credentials in `.aws/` or `.ssh/` reported clean and the publish dialog
+    /// told the user it was safe to publish.
+    #[test]
+    fn scan_folder_looks_inside_dot_directories() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".aws")).unwrap();
+        fs::write(
+            dir.path().join(".aws").join("credentials"),
+            "aws_access_key_id = AKIA1234567890ABCDEF\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join(".ssh")).unwrap();
+        fs::write(
+            dir.path().join(".ssh").join("id_rsa"),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
+
+        let found = scan_folder(dir.path()).unwrap();
+        assert!(
+            found.iter().any(|f| f.path.starts_with(".aws/")),
+            "must scan .aws: {found:?}"
+        );
+        assert!(
+            found.iter().any(|f| f.rule == "Private Key"),
+            "must scan .ssh: {found:?}"
+        );
+    }
+
+    /// Generated output stays skipped — that's what keeps the scan fast and
+    /// quiet. `.git` in particular holds packed objects we must not walk.
+    #[test]
+    fn scan_folder_still_skips_generated_output() {
+        let dir = TempDir::new().unwrap();
+        for d in [".git", "node_modules"] {
+            fs::create_dir(dir.path().join(d)).unwrap();
+            fs::write(
+                dir.path().join(d).join("leak.txt"),
+                "token = ghp_1234567890abcdefghijklmnopqrstuvwxyzAB\n",
+            )
+            .unwrap();
+        }
+        assert!(scan_folder(dir.path()).unwrap().is_empty());
+    }
+
+    // --- The commit/amend gate --------------------------------------------
+
+    /// Stage a file containing a secret and return the repo dir.
+    fn repo_with_staged_secret() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        // Assembled at runtime so this source file doesn't trip its own scanner.
+        let token = format!("ghp_{}", "1234567890abcdefghijklmnopqrstuvwxyzAB");
+        fs::write(
+            dir.path().join("config.py"),
+            format!("TOKEN = \"{token}\"\n"),
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("config.py")).unwrap();
+        index.write().unwrap();
+        dir
+    }
+
+    #[test]
+    fn gate_blocks_staged_secrets() {
+        let dir = repo_with_staged_secret();
+        let err = gate(dir.path(), false).unwrap_err();
+        assert!(
+            matches!(err.kind, crate::error::ErrorKind::SecretsFound),
+            "expected SecretsFound, got {:?}",
+            err.kind
+        );
+    }
+
+    /// The typed confirmation in the UI is the only way past, and it must work —
+    /// a gate with no escape hatch gets worked around instead of used.
+    #[test]
+    fn gate_honours_the_typed_override() {
+        let dir = repo_with_staged_secret();
+        assert!(gate(dir.path(), true).is_ok());
+    }
+
+    #[test]
+    fn gate_passes_clean_staged_changes() {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("main.py"), "print('hello')\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("main.py")).unwrap();
+        index.write().unwrap();
+        assert!(gate(dir.path(), false).is_ok());
+    }
+
     fn scan(content: &str) -> Vec<Finding> {
         let mut out = Vec::new();
         scan_line("config.txt", 1, content, &mut out);
@@ -537,5 +680,37 @@ mod tests {
     fn low_entropy_prose_does_not_flag() {
         let hits = scan("password = please remember to change this later");
         assert!(hits.is_empty(), "prose sentence must not flag: {hits:?}");
+    }
+
+    /// A Rust/C++ path whose type name contains a trigger word ("credential",
+    /// "token", "key") is not an assignment. The `::` separator used to be read
+    /// as `=`, flagging enum constants like `CredentialType::USER_PASS_PLAINTEXT`.
+    #[test]
+    fn rust_path_separator_is_not_a_secret_assignment() {
+        for line in [
+            "            CredentialType::USER_PASS_PLAINTEXT",
+            "        allowed.contains(CredentialType::USER_PASS_PLAINTEXT)",
+            "    let t = TokenKind::IDENTIFIER_LITERAL;",
+            "        ApiKey::SOME_LONG_ASSOCIATED_CONST",
+        ] {
+            let hits = scan(line);
+            assert!(
+                hits.is_empty(),
+                "path separator flagged as secret: {line:?} -> {hits:?}"
+            );
+        }
+    }
+
+    /// The `::` guard must not blind the scanner to a genuine secret on a line
+    /// that also happens to contain a path.
+    #[test]
+    fn real_assignment_still_flags_even_near_a_path() {
+        // Assemble the fake key at runtime so this test file doesn't trip its own
+        // scanner when committed through GitGlass: the literal never appears
+        // contiguously in source. (The pre-existing fixtures below get away with
+        // literals only because they were committed before the scanner existed.)
+        let fake_aws = format!("AKIA{}", "1234567890ABCDEF");
+        let hits = scan(&format!("let api_key = \"{fake_aws}\"; // near std::env"));
+        assert!(!hits.is_empty(), "real key next to a path must still flag");
     }
 }

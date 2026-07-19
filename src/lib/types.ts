@@ -149,6 +149,8 @@ export interface FileDiff {
   path: string;
   isBinary: boolean;
   hunks: DiffHunk[];
+  /** True when the diff was too large and the backend cut it short. */
+  truncated: boolean;
 }
 
 export interface BranchInfo {

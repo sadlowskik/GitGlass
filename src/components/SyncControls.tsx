@@ -1,6 +1,6 @@
 import clsx from "clsx";
 import { useAppStore } from "@/store/useAppStore";
-import { DownloadIcon, UploadIcon } from "./icons";
+import { DownloadIcon, UploadIcon, RefreshIcon } from "./icons";
 import { BranchMenu } from "./BranchMenu";
 
 /**
@@ -14,6 +14,7 @@ export function SyncControls() {
   const busy = useAppStore((s) => s.busy);
   const pull = useAppStore((s) => s.pull);
   const push = useAppStore((s) => s.push);
+  const fetch = useAppStore((s) => s.fetch);
 
   if (!repo) return null;
 
@@ -33,6 +34,14 @@ export function SyncControls() {
       )}
 
       <div className="ml-0.5 flex items-center overflow-hidden rounded-lg border border-white/10">
+        <SyncButton
+          label="Fetch"
+          onClick={() => void fetch()}
+          disabled={busy}
+        >
+          <RefreshIcon className="h-4 w-4" />
+        </SyncButton>
+        <div className="h-5 w-px bg-white/10" />
         <SyncButton
           label="Pull"
           onClick={() => void pull()}

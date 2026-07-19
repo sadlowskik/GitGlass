@@ -8,6 +8,8 @@ import { SecretGuardDialog } from "./components/SecretGuardDialog";
 import { DiffViewer } from "./components/DiffViewer";
 import { AutomationsDialog } from "./components/AutomationsDialog";
 import { InitRepoDialog } from "./components/InitRepoDialog";
+import { IdentityDialog } from "./components/IdentityDialog";
+import { DiscardDialog } from "./components/DiscardDialog";
 import { GithubDialogs } from "./components/GithubDialogs";
 import { StatusLegend } from "./components/StatusLegend";
 import { Toaster } from "./components/Toaster";
@@ -46,6 +48,8 @@ export default function App() {
       <AutomationsDialog />
       <InitRepoDialog />
       <SecretGuardDialog />
+      <IdentityDialog />
+      <DiscardDialog />
       <GithubDialogs />
       <Toaster />
     </div>
