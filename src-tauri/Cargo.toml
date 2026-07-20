@@ -1,6 +1,6 @@
 [package]
 name = "gitglass"
-version = "0.2.1"
+version = "0.2.3"
 description = "A visual file explorer with Git and GitHub built in."
 authors = ["The GitGlass authors"]
 license = "Apache-2.0"

@@ -26,7 +26,7 @@ crossing the IPC boundary is rewritten into a sentence a non-developer can act o
 | Frontend | React 18, TypeScript 5.6, Vite 5, Zustand 5, Tailwind 3 | `package.json` |
 | Tests | `cargo test` (inline `#[cfg(test)]` modules), Vitest for TS | |
 
-Version is `0.2.1`, and must be kept identical in **four** places:
+Version is `0.2.3`, and must be kept identical in **four** places:
 `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and the
 `gitglass` entry in `src-tauri/Cargo.lock` (refreshed by any `cargo` command
 after bumping `Cargo.toml`). `package-lock.json` carries it twice and is updated
